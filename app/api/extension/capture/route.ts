@@ -48,7 +48,13 @@ export async function POST(request: Request) {
       ? [...new Set(body.tags.map((x: unknown) => safeText(x, 40).replace(/^#/, "").toLowerCase()).filter(Boolean))].slice(0, 12)
       : suggestion.tags;
     const now = new Date();
-    const item = { userId: user._id, url: normalized, canonicalUrl, platform, contentType: safeText(body.contentType, 30) || "other", title, description: metadata.description || "", thumbnailUrl: metadata.thumbnailUrl || "", authorName: metadata.authorName || "", authorUrl: "", notes: safeText(body.notes, 5000), status: "unread", reason: safeText(body.reason, 50) || suggestion.reason, categoryId: category?._id || null, categoryName: category?.name || "", tags, savedAt: now, updatedAt: now, completedAt: null, archivedAt: null, reminderAt: null, lastOpenedAt: null };
+    // The capturer saw the live page: if the server's fetch couldn't get a preview image (TikTok
+    // and other SPAs block server requests), trust the poster the page itself rendered. Only
+    // https sources are accepted, and it must not be a TikTok 404-fallback URL.
+    let thumbnailUrl = metadata.thumbnailUrl || "";
+    const clientThumb = safeText(body.thumbnailUrl, 1000);
+    if (!thumbnailUrl && /^https:\/\/[^\s]+$/i.test(clientThumb) && !clientThumb.includes("tiktok.com/404")) thumbnailUrl = clientThumb;
+    const item = { userId: user._id, url: normalized, canonicalUrl, platform, contentType: safeText(body.contentType, 30) || "other", title, description: metadata.description || "", thumbnailUrl, authorName: metadata.authorName || "", authorUrl: "", notes: safeText(body.notes, 5000), status: "unread", reason: safeText(body.reason, 50) || suggestion.reason, categoryId: category?._id || null, categoryName: category?.name || "", tags, savedAt: now, updatedAt: now, completedAt: null, archivedAt: null, reminderAt: null, lastOpenedAt: null };
     const result = await coll.insertOne(item);
     await db.collection("activity").insertOne({ userId: user._id, itemId: result.insertedId, type: "saved", createdAt: now });
     await Promise.all(tags.map((name) => db.collection("tags").updateOne({ userId: user._id, name }, { $setOnInsert: { userId: user._id, name, createdAt: now } }, { upsert: true })));
