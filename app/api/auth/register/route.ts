@@ -3,9 +3,11 @@ import { database } from "@/lib/db";
 import { createSession, hashPassword } from "@/lib/auth";
 import { handleError, jsonError, safeText } from "@/lib/http";
 import { seedDefaults } from "@/lib/defaults";
+import { rateLimited } from "@/lib/rate-limit";
 
 export async function POST(request: Request) {
   try {
+    if (await rateLimited(request, "register", 5, 60 * 60 * 1000)) return jsonError("Too many signup attempts. Try again later.", 429);
     const body = await request.json();
     const name = safeText(body.name, 80), email = safeText(body.email, 254).toLowerCase(), password = typeof body.password === "string" ? body.password : "";
     if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 10 || password.length > 128) return jsonError("Enter your name, a valid email, and a password with at least 10 characters.");
