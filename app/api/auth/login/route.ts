@@ -1,9 +1,11 @@
 import { database } from "@/lib/db";
 import { createSession, verifyPassword } from "@/lib/auth";
 import { handleError, jsonError, safeText } from "@/lib/http";
+import { rateLimited } from "@/lib/rate-limit";
 
 export async function POST(request: Request) {
   try {
+    if (await rateLimited(request, "login", 10, 15 * 60 * 1000)) return jsonError("Too many sign-in attempts. Try again in a few minutes.", 429);
     const body = await request.json();
     const email = safeText(body.email, 254).toLowerCase();
     const password = typeof body.password === "string" ? body.password : "";
