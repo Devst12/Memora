@@ -296,7 +296,12 @@ async function saveCurrentTarget(linkUrl) {
       keywords: pageKeywords(),
       thumbnailUrl: currentPageThumbnail(),
     });
-    if (!result || !result.ok) {
+    if (result === undefined) {
+      // The service worker didn't answer: it was reloaded/updated after this page loaded, so
+      // this content script belongs to a dead extension context. Reload fixes it.
+      setFab("err");
+      showToast("Memora was updated — reload this page.", "Press F5 (or Ctrl+R) and the button will work again.", "");
+    } else if (!result || !result.ok) {
       setFab("err");
       showToast(result?.message || "Couldn't save this page.", "Check your connection or open the Memora popup to reconnect.");
     } else {
