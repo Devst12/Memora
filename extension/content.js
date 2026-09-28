@@ -1,17 +1,22 @@
 // Floating "Save to Memora" side button injected into every page.
 // One click saves the current page (or right-clicked link) instantly with an on-screen toast.
 // The button face is the Memora logo bundled with the extension; save state shows as a small
-// badge. The background resolves the real tab URL via chrome.tabs — required for SPA sites like
-// TikTok where location.href can be a stale or bare address — and gathers page keywords.
+// badge. On SPA feeds (TikTok) the item's identity is read from the page itself with strict
+// validation: the video nearest the viewport center is the one being watched, its ID is read
+// from surrounding DOM or the page's hydration JSON, and a save only proceeds on a stable ID.
+// When no identity can be found on a feed, the save is refused rather than storing a junk URL.
 
 const HOST_ID = "memora-float-root";
 const TOAST_MS = 3500;
 const EDGE_MARGIN = 18;
+const FEED_STABILITY_MS = 1000; // The same video ID must hold for this long before a save fires.
 
 let shadowRoot = null;
 let hideTimer = null;
 let saveTimer = null;
 let fabTop = null; // Persisted vertical position so the toast follows a dragged button.
+let lastSavedFeedId = ""; // Skip re-saves when the feed re-renders the same video.
+let lastSaveWasDuplicate = false; // Re-click after a duplicate should show the duplicate, not the feed refusal.
 
 function ensureShadow() {
   const existing = document.getElementById(HOST_ID);
@@ -93,35 +98,107 @@ function describe(result) {
   return [result.platform, chips].filter(Boolean).join(" · ");
 }
 
-// On SPA feeds the address bar doesn't follow the video (TikTok keeps showing tiktok.com or a
-// bare profile while you swipe). Each site here exposes the current item's identity in its own
-// DOM — a share-link control, a canonical element, or player state — and that exact URL is what
-// should be saved. Every probe is wrapped in try/catch: a redesign degrades to the tab URL.
-function currentPageUrl() {
-  try {
-    const host = location.hostname.replace(/^www\./, "");
-    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
-      const copyField = document.querySelector("[data-e2e='copy-link-input']");
-      if (copyField?.value && /tiktok\.com/.test(copyField.value)) return copyField.value;
-      // Feed pages embed the active video's own JSON (itemInfo / SIGI_STATE) with the canonical
-      // @user/video/<id> path — the strongest signal when the share dialog is closed.
-      for (const script of document.querySelectorAll("script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script#SIGI_STATE")) {
-        try {
-          const data = JSON.parse(script.textContent || "");
-          const modules = data.__DEFAULT_SCOPE__?.["webapp.video-detail"]?.itemInfo?.itemStruct || data.ItemModule || {};
-          for (const item of Object.values(modules)) {
-            const author = item?.author?.uniqueId || item?.author?.uniqueID;
-            const videoId = item?.id || item?.video?.id;
-            if (author && videoId) return `${location.origin}/@${author}/video/${videoId}`;
-          }
-        } catch { /* Malformed or unrelated script tag; try the next probe. */ }
-      }
-      const video = document.querySelector("video[src*='/video/'], video source[src*='/video/']");
-      const match = (video?.src || "").match(/(?:@[^/]+)\/video\/(\d{6,25})/);
-      if (match) return `${location.origin}/@${(document.querySelector("[data-e2e='browse-username']")?.textContent || "user").replace(/^@/, "")}/video/${match[1]}`;
-      const canonical = document.querySelector("link[rel='canonical']")?.href || document.querySelector("meta[property='og:url']")?.content;
-      if (canonical && /\/video\/\d{6,}/.test(canonical)) return canonical;
+// ---- TikTok / SPA feed identity detection -----------------------------------------------
+// TikTok's feed keeps several videos loaded (previous, current, next) and never changes the
+// address bar while you swipe. The video being watched is the one nearest the viewport center.
+
+function isTikTok() {
+  const host = location.hostname.replace(/^www\./, "");
+  return host === "tiktok.com" || host.endsWith(".tiktok.com");
+}
+
+// The <video> closest to the viewport center is the one the user is watching. Measured on
+// demand (no observers, no timers) — cheap and always current at click time.
+function activeVideo() {
+  const videos = document.querySelectorAll("video");
+  let best = null, bestDistance = Infinity;
+  const centerY = window.innerHeight / 2;
+  for (const video of videos) {
+    const rect = video.getBoundingClientRect();
+    if (rect.height < 40) continue; // Preload slots are tiny or zero-height.
+    const distance = Math.abs(rect.top + rect.height / 2 - centerY);
+    if (distance < bestDistance) { bestDistance = distance; best = video; }
+  }
+  return best;
+}
+
+// Climb from the active video through its ancestors looking for identity: a link to
+// /@user/video/<digits> (carries both author and id) or a long digit id in an attribute.
+// TikTok's 64-bit video ids are 18-19 digits; anything shorter is a false positive.
+function identityFromDom(video) {
+  const VIDEO_PATH = /\/@([^/?#]+)\/video\/(\d{17,20})/;
+  const BARE_ID = /(\d{17,20})/;
+  let node = video;
+  for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
+    const link = node.closest?.("a[href*='/video/']") || node.querySelector?.("a[href*='/video/']");
+    if (link) {
+      const match = (link.getAttribute("href") || "").match(VIDEO_PATH);
+      if (match) return { author: match[1], id: match[2] };
     }
+    for (const attribute of ["id", "data-e2e", "data-video-id"]) {
+      const value = node.getAttribute?.(attribute) || "";
+      if (attribute === "data-e2e") continue; // Names like "video-card-123" are UI labels, not ids.
+      const match = value.match(BARE_ID);
+      if (match) {
+        // No author here — the hydration JSON below usually fills it; otherwise the save waits.
+        return { author: null, id: match[1] };
+      }
+    }
+  }
+  return null;
+}
+
+// Feed pages embed the active video's hydration JSON with the canonical path and caption.
+function identityFromHydration() {
+  for (const script of document.querySelectorAll("script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script#SIGI_STATE")) {
+    try {
+      const data = JSON.parse(script.textContent || "");
+      const modules = data.__DEFAULT_SCOPE__?.["webapp.video-detail"]?.itemInfo?.itemStruct
+        ? [data.__DEFAULT_SCOPE__["webapp.video-detail"].itemInfo.itemStruct]
+        : Object.values(data.ItemModule || {});
+      for (const item of modules) {
+        const author = item?.author?.uniqueId || item?.author?.uniqueID || null;
+        const videoId = item?.id || item?.video?.id || null;
+        if (videoId && /^\d{17,20}$/.test(String(videoId))) {
+          return { author, id: String(videoId), caption: item?.desc ? String(item.desc).slice(0, 300) : "" };
+        }
+      }
+    } catch { /* Malformed or unrelated script tag; try the next one. */ }
+  }
+  return null;
+}
+
+// Returns { url, title, id } for the video being watched, or { refused: true } when the feed
+// shows no resolvable video. Refusing beats saving tiktok.com junk the user can never reopen.
+function currentFeedItem() {
+  if (!isTikTok()) return null;
+  const fromDom = identityFromDom(activeVideo() || document.body) || {};
+  const fromJson = identityFromHydration();
+  // Hydration JSON reflects the last *navigated* video, not necessarily the one on screen, so a
+  // DOM id wins when both exist. The author is interchangeable between the two sources.
+  const id = fromDom.id || fromJson?.id || null;
+  if (!id) return { refused: true };
+  const author = fromDom.author || fromJson?.author || null;
+  if (!author) return { refused: true }; // Building /video/<id> without an author guesses wrong.
+  return {
+    id,
+    url: `${location.origin}/@${author}/video/${id}`,
+    title: fromJson?.caption || document.querySelector("[data-e2e='browse-video-desc'], [itemprop='description']")?.textContent?.trim().slice(0, 300) || "",
+  };
+}
+
+// Non-feed pages (a direct TikTok video URL, or any other site): the tab URL is the identity.
+function currentPageUrl() {
+  if (isTikTok()) {
+    const feedItem = currentFeedItem();
+    if (feedItem?.refused) return null;
+    if (feedItem?.url) return feedItem.url;
+  }
+  try {
+    const copyField = document.querySelector("[data-e2e='copy-link-input']");
+    if (copyField?.value && /tiktok\.com/.test(copyField.value)) return copyField.value;
+    const canonical = document.querySelector("link[rel='canonical']")?.href || document.querySelector("meta[property='og:url']")?.content;
+    if (canonical && /\/video\/\d{17,20}/.test(canonical)) return canonical;
   } catch { /* Fall through to the plain tab URL. */ }
   return null;
 }
@@ -146,21 +223,9 @@ function pageKeywords() {
 // "TikTok - Make Your Day"). Probes stay site-specific and best-effort.
 function currentPageTitle() {
   try {
-    const host = location.hostname.replace(/^www\./, "");
-    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
-      const h1 = document.querySelector("[data-e2e='browse-video-desc'], [itemprop='description']");
-      if (h1?.textContent?.trim()) return h1.textContent.trim().slice(0, 300);
-      // Same embedded JSON that carries the video id also carries the real caption.
-      for (const script of document.querySelectorAll("script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script#SIGI_STATE")) {
-        try {
-          const data = JSON.parse(script.textContent || "");
-          const modules = data.__DEFAULT_SCOPE__?.["webapp.video-detail"]?.itemInfo?.itemStruct || data.ItemModule || {};
-          for (const item of Object.values(modules)) {
-            const caption = item?.desc;
-            if (caption) return String(caption).slice(0, 300);
-          }
-        } catch { /* Malformed or unrelated script tag; try the next probe. */ }
-      }
+    if (isTikTok()) {
+      const feedItem = currentFeedItem();
+      if (feedItem?.title) return feedItem.title;
     }
   } catch { /* Fall through to document.title. */ }
   return document.title || "";
@@ -170,7 +235,7 @@ function currentPageTitle() {
 // already has the image loaded, so send it along for the card thumbnail.
 function currentPageThumbnail() {
   try {
-    const video = document.querySelector("video[poster]");
+    const video = activeVideo() || document.querySelector("video[poster]");
     if (video?.poster && /^https:\/\//.test(video.poster)) return video.poster;
     const img = document.querySelector("img[src*='thumbnail'], img[src*='/aweme/']");
     const src = img?.getAttribute("src");
@@ -179,9 +244,50 @@ function currentPageThumbnail() {
   return "";
 }
 
+// ---- Saving -------------------------------------------------------------------------------
+
+// Feeds are swiped fast: the button is only "live" while the same video ID has been on screen
+// for a moment. The check runs once per click (no timers) — if the ID is younger than the
+// stability window, the user just swiped; wait for the next click instead of guessing.
+let feedStableSince = 0;
+let feedStableId = "";
+function feedStabilityCheck() {
+  if (!isTikTok()) return true;
+  const feedItem = currentFeedItem();
+  const currentId = feedItem?.refused ? "" : feedItem.id || "";
+  if (currentId !== feedStableId) { feedStableId = currentId; feedStableSince = Date.now(); }
+  return Date.now() - feedStableSince >= FEED_STABILITY_MS;
+}
+
 async function saveCurrentTarget(linkUrl) {
   if (saveTimer) return; // A save is already running; ignore repeat clicks until it settles.
   setFab("busy");
+
+  // Right-clicked links save directly; feed pages need a stable, resolvable video identity.
+  if (!linkUrl && isTikTok()) {
+    if (!feedStabilityCheck()) {
+      showToast("Hold on — you just swiped.", "Click the button again once the video settles.", "");
+      saveTimer = setTimeout(() => { saveTimer = null; setFab("idle"); }, 1200);
+      return;
+    }
+    const feedItem = currentFeedItem();
+    if (feedItem?.refused) {
+      if (lastSaveWasDuplicate && lastSavedFeedId) {
+        lastSaveWasDuplicate = false; // The feed re-rendered the already-saved video; report that.
+        showToast("Already saved", "This video is in your memory — scroll for the next one.", "");
+      } else {
+        showToast("No video detected yet.", "TikTok is still loading this one — click again in a moment.", "");
+      }
+      saveTimer = setTimeout(() => { saveTimer = null; setFab("idle"); }, 1200);
+      return;
+    }
+    if (feedItem.id === lastSavedFeedId) {
+      showToast("Already saved", "This video is in your memory — scroll for the next one.", "");
+      saveTimer = setTimeout(() => { saveTimer = null; setFab("idle"); }, 1200);
+      return;
+    }
+  }
+
   try {
     const result = await chrome.runtime.sendMessage({
       type: "memora-save",
@@ -195,6 +301,13 @@ async function saveCurrentTarget(linkUrl) {
       showToast(result?.message || "Couldn't save this page.", "Check your connection or open the Memora popup to reconnect.");
     } else {
       setFab(result.duplicate ? "idle" : "ok");
+      if (!linkUrl && isTikTok()) {
+        const feedItem = currentFeedItem();
+        if (feedItem?.id) {
+          lastSavedFeedId = feedItem.id;
+          lastSaveWasDuplicate = Boolean(result.duplicate);
+        }
+      }
       showToast(
         result.duplicate ? result.title || "Already saved" : result.title || "Saved",
         (result.duplicate ? "Already in your memory · " : "Saved · ") + describe(result),
