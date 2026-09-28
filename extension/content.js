@@ -9,7 +9,6 @@
 const HOST_ID = "memora-float-root";
 const TOAST_MS = 3500;
 const EDGE_MARGIN = 18;
-const FEED_STABILITY_MS = 1000; // The same video ID must hold for this long before a save fires.
 
 let shadowRoot = null;
 let hideTimer = null;
@@ -193,8 +192,17 @@ function identityFromCardLink(video) {
 
 // Returns { url, title, id } for the video being watched, or { refused: true } when nothing
 // resolves. Refusing beats saving tiktok.com junk the user can never reopen.
+let feedMemo = null, feedMemoAt = 0;
 function currentFeedItem() {
   if (!isTikTok()) return null;
+  const now = Date.now();
+  if (feedMemo && now - feedMemoAt < 400) return feedMemo;
+  feedMemo = computeFeedItem();
+  feedMemoAt = now;
+  return feedMemo;
+}
+
+function computeFeedItem() {
   const video = activeVideo();
   const found = identityFromLocation() || identityFromReact(video) || identityFromTap(video) || identityFromCardLink(video);
   if (!found?.id) return { refused: true };
@@ -203,6 +211,7 @@ function currentFeedItem() {
   const caption = found.caption || tapItems.get(found.id)?.caption || "";
   return {
     id: found.id,
+    author,
     url: `${location.origin}/@${author}/video/${found.id}`,
     title: caption || cardOf(video)?.querySelector("[data-e2e='video-desc'], [data-e2e='browse-video-desc']")?.textContent?.trim().slice(0, 300) || "",
   };
@@ -267,30 +276,12 @@ function currentPageThumbnail() {
 
 // ---- Saving -------------------------------------------------------------------------------
 
-// Feeds are swiped fast: the button is only "live" while the same video ID has been on screen
-// for a moment. The check runs once per click (no timers) — if the ID is younger than the
-// stability window, the user just swiped; wait for the next click instead of guessing.
-let feedStableSince = 0;
-let feedStableId = "";
-function feedStabilityCheck() {
-  if (!isTikTok()) return true;
-  const feedItem = currentFeedItem();
-  const currentId = feedItem?.refused ? "" : feedItem.id || "";
-  if (currentId !== feedStableId) { feedStableId = currentId; feedStableSince = Date.now(); }
-  return Date.now() - feedStableSince >= FEED_STABILITY_MS;
-}
-
 async function saveCurrentTarget(linkUrl) {
   if (saveTimer) return; // A save is already running; ignore repeat clicks until it settles.
   setFab("busy");
 
   // Right-clicked links save directly; feed pages need a stable, resolvable video identity.
   if (!linkUrl && isTikTok()) {
-    if (!feedStabilityCheck()) {
-      showToast("Hold on — you just swiped.", "Click the button again once the video settles.", "");
-      saveTimer = setTimeout(() => { saveTimer = null; setFab("idle"); }, 1200);
-      return;
-    }
     const feedItem = currentFeedItem();
     if (feedItem?.refused) {
       if (lastSaveWasDuplicate && lastSavedFeedId) {
@@ -310,10 +301,12 @@ async function saveCurrentTarget(linkUrl) {
   }
 
   try {
+    const target = !linkUrl && isTikTok() ? currentFeedItem() : null;
     const result = await chrome.runtime.sendMessage({
       type: "memora-save",
-      url: linkUrl || currentPageUrl() || null, // null = let the background resolve the tab URL
-      title: currentPageTitle() || document.title || "",
+      url: linkUrl || target?.url || currentPageUrl() || null, // null = let the background resolve the tab URL
+      title: target ? target.title : currentPageTitle() || document.title || "",
+      author: target?.author || "",
       keywords: pageKeywords(),
       thumbnailUrl: currentPageThumbnail(),
     });

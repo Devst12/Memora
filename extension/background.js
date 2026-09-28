@@ -26,18 +26,53 @@ async function resolveTab(url, sender) {
   } catch { return null; }
 }
 
-async function save({ url: rawUrl, title: pageTitle, keywords }, sender) {
+const GENERIC_TITLE = /^\s*(tiktok\b.*|make your day)?\s*$/i;
+
+// TikTok pages are client-rendered, so a server can't scrape them. TikTok's public oEmbed
+// endpoint returns the caption, author and thumbnail for a video URL in one small JSON call,
+// with no login. The service worker has host permission for it, so no CORS problem.
+async function tiktokDetails(url) {
+  if (!/^https?:\/\/(www\.)?tiktok\.com\/@[^/]+\/video\/\d+/i.test(url)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const response = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`, { signal: controller.signal });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return { title: data.title || "", author: data.author_name || "", thumbnailUrl: data.thumbnail_url || "" };
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+function hashtagWords(text) {
+  return [...String(text || "").matchAll(/#([\p{L}\p{N}_]{2,24})/gu)].map((m) => m[1].toLowerCase());
+}
+
+async function save({ url: rawUrl, title: pageTitle, keywords, thumbnailUrl, author }, sender) {
   const { apiUrl, token } = await chrome.storage.local.get(["apiUrl", "token"]);
   if (!apiUrl || !token) {
     return { ok: false, message: "Memora isn't connected. Open the popup to add your app URL and capture token." };
   }
   const resolved = await resolveTab(rawUrl, sender);
   if (!resolved) return { ok: false, message: "This page can't be saved." };
+
+  let title = GENERIC_TITLE.test(pageTitle || "") ? "" : pageTitle;
+  let thumb = thumbnailUrl || "";
+  let by = author || "";
+  // Only pay for the oEmbed call when the page didn't already give us a real caption.
+  if (!title || !thumb || !by) {
+    const details = await tiktokDetails(resolved.url);
+    if (details) { title = title || details.title; thumb = thumb || details.thumbnailUrl; by = by || details.author; }
+  }
+  const words = [...new Set([...hashtagWords(title), ...(Array.isArray(keywords) ? keywords : [])])].slice(0, 16);
+
   try {
     const { status, body } = await capture({ apiUrl, token }, {
       url: resolved.url,
-      pageTitle,
-      keywords: Array.isArray(keywords) ? keywords : [],
+      pageTitle: title || pageTitle || resolved.title || "",
+      description: title || "",
+      author: by,
+      thumbnailUrl: thumb,
+      keywords: words,
     });
     if (status === 409) {
       return { ok: true, duplicate: true, title: body.title, platform: body.platform, thumbnailUrl: body.thumbnailUrl, message: body.message };
@@ -45,7 +80,7 @@ async function save({ url: rawUrl, title: pageTitle, keywords }, sender) {
     if (!status || status >= 400) {
       return { ok: false, message: body.error || `Couldn't save (HTTP ${status || "network error"}).` };
     }
-    return { ok: true, title: body.title, platform: body.platform, reason: body.reason, categoryName: body.categoryName, tags: body.tags, thumbnailUrl: body.thumbnailUrl, message: body.message };
+    return { ok: true, title: body.title, platform: body.platform, reason: body.reason, categoryName: body.categoryName, tags: body.tags, thumbnailUrl: body.thumbnailUrl || thumb, message: body.message };
   } catch {
     return { ok: false, message: "Network error — is your Memora app running?" };
   }
