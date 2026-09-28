@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Save to Memora</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <header><span class="mark">m</span><div><strong>Memora</strong><small>Your digital memory</small></div><button id="settings" aria-label="Settings">⚙</button></header>
+    <main id="config" hidden>
+      <h1>Connect to Memora</h1><p>Use the capture token from Settings in your Memora account.</p>
+      <label>Memora app URL<input id="apiUrl" type="url" placeholder="https://your-memora-app.example"></label>
+      <label>Capture token<input id="token" type="password" placeholder="mem_…"></label>
+      <button class="primary" id="connect">Connect</button><p class="hint">Your token stays on this device and can be revoked from Memora.</p>
+    </main>
+    <main id="capture" hidden>
+      <p class="eyebrow">CURRENT PAGE</p><div class="url" id="url"></div>
+      <label>Title<input id="title" maxlength="300"></label>
+      <label>Why are you saving this?<select id="reason"><option value="">Choose a reason</option><option>Learn</option><option>Inspiration</option><option>Watch Later</option><option>Use Later</option><option>Work</option><option>Buy</option><option>Personal</option><option>Other</option></select></label>
+      <label>Category<select id="category"><option value="">No category</option></select></label>
+      <label>Note<textarea id="notes" rows="3" placeholder="What do you want to remember?"></textarea></label>
+      <button class="primary" id="save">Save to Memory</button>
+    </main>
+    <p id="message" role="status"></p>
+    <script src="popup.js"></script>
+  </body>
+</html>
