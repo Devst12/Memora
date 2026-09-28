@@ -19,7 +19,34 @@ export function normalizeUrl(value: unknown) {
   }
   const youtubeId = url.pathname.match(/^\/(?:shorts|embed)\/([^/]+)/)?.[1];
   if (url.hostname === "youtube.com" && youtubeId) { url.pathname = "/watch"; url.search = `?v=${encodeURIComponent(youtubeId)}`; }
+  canonicalizeTikTok(url);
   return url.toString().replace(/\/$/, url.pathname === "/" ? "/" : "");
+}
+
+// TikTok serves the same video from many addresses: bare tiktok.com (SPA home while scrolling),
+// vm./m. short codes, @user/video/123 variants with share-tracking params, and /v/ embed pages.
+// Collapse them all to one address per video so one video is one memory, not five.
+function canonicalizeTikTok(url: URL) {
+  if (url.hostname !== "tiktok.com" && !url.hostname.endsWith(".tiktok.com")) return;
+  url.hostname = "tiktok.com";
+  const params = url.searchParams;
+  const dropAllParams = () => { for (const key of [...params.keys()]) params.delete(key); };
+  // Share-tracking junk rides along on every TikTok page form; drop it everywhere.
+  for (const key of [...params.keys()]) if (/^(is_from_webapp|sender_device|web_id|_r|_t|refer|u_code|share_item_id|share_app_id|tt_from|share_link_id|_d|lg_|author_id|item_id)$/i.test(key)) params.delete(key);
+  // Full and embed pages (/v/@user/video/123.html): the @user/video/<id> path IS the identity.
+  const video = url.pathname.match(/(?:^|^\/v\/)(@[^/]+)\/video\/(\d{6,25})/);
+  if (video) { url.pathname = `${video[1]}/video/${video[2]}`; dropAllParams(); return; }
+  // Explicit /t/<code> share links are self-identifying short codes.
+  const short = url.pathname.match(/^\/t\/([A-Za-z0-9]{5,24})\/?$/);
+  if (short) { url.pathname = `/t/${short[1]}`; dropAllParams(); return; }
+  // Bare short codes (vm.tiktok.com/VIDEOID): base62 containing a digit or uppercase letter —
+  // browse pages (/foryou, /discover…) are lowercase words, so they keep their own identity.
+  const BROWSE_PAGES = new Set(["foryou", "following", "discover", "explore", "live", "upload", "login", "signup", "search", "inbox", "notice", "messages", "settings", "business", "creators", "sound", "download", "legal", "about", "careers", "press", "safety", "transparency"]);
+  const bare = url.pathname.match(/^\/([A-Za-z0-9]{5,24})\/?$/);
+  if (bare && !BROWSE_PAGES.has(bare[1].toLowerCase()) && /[A-Z0-9]/.test(bare[1])) {
+    url.pathname = `/t/${bare[1]}`; dropAllParams();
+  }
+  // Anything else (bare SPA home, @user profiles) keeps its own identity — no guessing.
 }
 
 export function detectPlatform(value: string): Platform {
