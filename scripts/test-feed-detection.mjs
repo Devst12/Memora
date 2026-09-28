@@ -1,70 +1,54 @@
-/* eslint-disable @typescript-eslint/no-this-alias */
-// Verifies the detection logic ported from extension/content.js against simulated DOM shapes.
-// The functions below mirror the content script; keep them in sync or extract later.
+// Verifies the detection and resolution logic from extension/content.js against simulated data.
+// The functions mirror the content script; keep them in sync or extract later.
 
-function identityFromDomLike(video) {
-  const VIDEO_PATH = /\/@([^/?#]+)\/video\/(\d{17,20})/;
-  const BARE_ID = /(\d{17,20})/;
-  let node = video;
-  for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
-    const link = node.closest?.("a[href*='/video/']") || node.querySelector?.("a[href*='/video/']");
-    if (link) {
-      const match = (link.getAttribute("href") || "").match(VIDEO_PATH);
-      if (match) return { author: match[1], id: match[2] };
+// ---- Deep hydration scan (mirrors collectHydrationItems) ----------------------------
+function collectHydrationItems(scripts) {
+  const items = [];
+  const seen = new Set();
+  function dig(value, depth) {
+    if (!value || depth > 8 || seen.has(value)) return;
+    if (Array.isArray(value)) { for (const entry of value) dig(entry, depth + 1); return; }
+    if (typeof value !== "object") return;
+    seen.add(value);
+    const id = value.id ?? value.aweme_id ?? value.video?.id;
+    if (id && /^\d{17,20}$/.test(String(id)) && (value.author || value.video)) {
+      items.push({
+        id: String(id),
+        author: value.author?.uniqueId || value.author?.uniqueID || null,
+        caption: value.desc ? String(value.desc).slice(0, 300) : "",
+        cover: value.video?.cover || value.video?.originCover || value.video?.dynamicCover || "",
+      });
+      return;
     }
-    for (const attribute of ["id", "data-e2e", "data-video-id"]) {
-      const value = node.getAttribute?.(attribute) || "";
-      if (attribute === "data-e2e") continue;
-      const match = value.match(BARE_ID);
-      if (match) return { author: null, id: match[1] };
-    }
+    for (const key of Object.keys(value)) dig(value[key], depth + 1);
   }
-  return null;
-}
-
-function activeVideoLike(videos) {
-  let best = null, bestDistance = Infinity;
-  const centerY = 400; // viewport 800 tall
-  for (const video of videos) {
-    const rect = video.getBoundingClientRect();
-    if (rect.height < 40) continue;
-    const distance = Math.abs(rect.top + rect.height / 2 - centerY);
-    if (distance < bestDistance) { bestDistance = distance; best = video; }
+  for (const text of scripts) {
+    try { dig(JSON.parse(text), 0); } catch { /* Malformed script. */ }
   }
-  return best;
+  return items;
 }
 
-// --- Fake DOM helpers ---------------------------------------------------------------
-function makeElement(attrs = {}, parent = null) {
-  return {
-    attrs,
-    parentElement: parent,
-    getAttribute(name) { return this.attrs[name] ?? null; },
-    closest(selector) {
-      if (!selector.includes("a[href*='/video/']")) return null;
-      for (let node = this; node; node = node.parentElement) { if (node.attrs.href?.includes("/video/")) return node; }
-      return null;
-    },      querySelector(selector) {
-      if (selector.includes("a[href*='/video/']")) {
-        const stack = [this];
-        while (stack.length) {
-          const current = stack.pop();
-          for (const child of current.children || []) {
-            if (child.attrs.href?.includes("/video/")) return child;
-            stack.push(child);
-          }
-        }
-      }
-      return null;
-    },
-    children: [],
-  };
-}
-
-function makeVideo(top, height, parent = null) {
-  const video = makeElement({}, parent);
-  video.getBoundingClientRect = () => ({ top, height });
-  return video;
+// ---- Resolution cascade (mirrors currentFeedItem's core) ----------------------------
+function resolveFeed({ fromDom, tapped, hydration, description }) {
+  if (fromDom) return { id: fromDom.id, author: fromDom.author, title: description || "" };
+  const candidates = [...tapped, ...hydration];
+  const uniqueById = new Map();
+  for (const item of candidates) if (item.id && !uniqueById.has(item.id)) uniqueById.set(item.id, item);
+  const pool = [...uniqueById.values()];
+  if (!pool.length) return { refused: true };
+  if (description) {
+    const normalize = (text) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+    const wanted = normalize(description);
+    const captionMatch = pool.find((item) => item.caption && normalize(item.caption) === wanted)
+      || pool.find((item) => item.caption && wanted.length > 20 && (wanted.includes(normalize(item.caption)) || normalize(item.caption).includes(wanted)));
+    if (captionMatch) return { id: captionMatch.id, author: captionMatch.author, title: captionMatch.caption || description };
+  }
+  if (pool.length === 1) return { id: pool[0].id, author: pool[0].author, title: pool[0].caption || description };
+  if (pool.every((item) => item.author && item.author === pool[0].author)) {
+    const item = pool[pool.length - 1];
+    return { id: item.id, author: item.author, title: item.caption || description };
+  }
+  return { refused: true };
 }
 
 let passed = 0, failed = 0;
@@ -73,57 +57,55 @@ function check(name, condition) {
   else { failed++; console.log(`FAIL  ${name}`); }
 }
 
-// 1. Centered video wins over first video
+const NASA = { id: "7284567890123456789", author: "nasa", caption: "How engineers test spacecraft parachutes #nasa #space", cover: "https://p19-sign.tiktokcdn.com/cover.jpeg" };
+const CHEF = { id: "7359123456789012345", author: "gordonramsayvideo", caption: "Easy pasta recipe #cooking #italianfood", cover: "" };
+
+// 1. DOM identity wins over everything
+check("dom author+id wins", resolveFeed({ fromDom: { author: "nasa", id: NASA.id }, tapped: [CHEF], hydration: [], description: "" }).author === "nasa");
+
+// 2. Deep scan finds items nested under unknown schema keys
 {
-  const prev = makeVideo(-600, 700);  // mostly above viewport
-  const current = makeVideo(50, 700); // centered
-  const next = makeVideo(760, 700);   // below
-  check("picks the centered video, not the first", activeVideoLike([prev, current, next]) === current);
+  const weird = { appState: { vitals: { list: [{ weirdModule: { aweme_id: CHEF.id, desc: CHEF.caption, author: { uniqueID: CHEF.author }, video: { cover: "x.jpg" } } }] } } };
+  const items = collectHydrationItems([JSON.stringify(weird)]);
+  check("deep scan finds items under unknown keys", items.length === 1 && items[0].id === CHEF.id && items[0].author === CHEF.author);
 }
-// 2. Tiny preload slot ignored
+// 3. Caption match resolves the active video from a multi-video pool
 {
-  const tiny = makeVideo(0, 10);
-  const real = makeVideo(100, 600);
-  check("ignores tiny preload videos", activeVideoLike([tiny, real]) === real);
+  const resolved = resolveFeed({ fromDom: null, tapped: [NASA, CHEF], hydration: [], description: "Easy pasta recipe #cooking #italianfood" });
+  check("caption match picks the on-screen video", resolved.id === CHEF.id && resolved.author === CHEF.author);
 }
-// 3. Parent-walk finds the /@user/video/<id> link
+// 4. Caption match with punctuation/case differences still hits
 {
-  const container = makeElement({ id: "feed-item-0" });
-  const link = makeElement({ href: "/@nasa/video/7284567890123456789?is_copy_url=1" }, container);
-  const video = makeVideo(0, 600, container);
-  container.children.push(link, video);
-  const identity = identityFromDomLike(video, {});
-  check("walks up to the video link with author+id", identity?.author === "nasa" && identity?.id === "7284567890123456789");
+  const resolved = resolveFeed({ fromDom: null, tapped: [NASA, CHEF], hydration: [], description: "EASY   PASTA RECIPE! #cooking" });
+  check("caption match ignores case and punctuation", resolved.id === CHEF.id);
 }
-// 4. data-e2e is never treated as an id source
+// 5. Single known candidate is unambiguous
 {
-  const wrapper = makeElement({ "data-e2e": "video-card-12345", id: "x" });
-  const video = makeVideo(0, 600, wrapper);
-  wrapper.children.push(video);
-  check("ignores data-e2e ui labels", identityFromDomLike(video, {}) === null);
+  const resolved = resolveFeed({ fromDom: null, tapped: [NASA], hydration: [], description: "" });
+  check("single candidate resolves without a description", resolved.id === NASA.id && resolved.author === "nasa");
 }
-// 5. Bare 19-digit id attribute accepted (author missing)
+// 6. Same-author pool (profile feed): newest wins
 {
-  const wrapper = makeElement({ "data-video-id": "7284567890123456789" });
-  const video = makeVideo(0, 600, wrapper);
-  wrapper.children.push(video);
-  const identity = identityFromDomLike(video, {});
-  check("accepts bare digit id without author", identity?.id === "7284567890123456789" && identity?.author === null);
+  const older = { id: "7100000000000000001", author: "nasa", caption: "Old rocket video" };
+  const resolved = resolveFeed({ fromDom: null, tapped: [older, NASA], hydration: [], description: "" });
+  check("same-author pool takes the newest item", resolved.id === NASA.id);
 }
-// 6. Short ids (16 digits or fewer) are rejected
+// 7. Ambiguous pool with no description refuses rather than guessing
 {
-  const wrapper = makeElement({ id: "item-728456789012345" });
-  const video = makeVideo(0, 600, wrapper);
-  wrapper.children.push(video);
-  check("rejects ids shorter than 17 digits", identityFromDomLike(video, {}) === null);
+  const other = { id: "7199999999999999999", author: "someoneelse", caption: "A different video" };
+  check("ambiguous pool without description refuses", resolveFeed({ fromDom: null, tapped: [NASA, other], hydration: [], description: "" }).refused === true);
 }
-// 7. Hydration JSON merges: bare dom id + hydration author
+// 8. Empty pool refuses
+check("no data at all refuses", resolveFeed({ fromDom: null, tapped: [], hydration: [], description: "" }).refused === true);
+// 9. Tapped items dedupe by id (feed refetches the same video)
 {
-  const domIdentity = { author: null, id: "7284567890123456789" };
-  const hydration = { author: "nasa", id: "7284567890123456789", caption: "How we test parachutes" };
-  const id = domIdentity.id || hydration.id;
-  const author = domIdentity.author || hydration.author;
-  check("merges dom id with hydration author", id === "7284567890123456789" && author === "nasa");
+  const resolved = resolveFeed({ fromDom: null, tapped: [NASA, { ...NASA, cover: "updated.jpeg" }], hydration: [], description: "" });
+  check("duplicate tapped ids collapse to one", resolved.id === NASA.id);
+}
+// 10. Hydration fallback when the tap missed the response
+{
+  const resolved = resolveFeed({ fromDom: null, tapped: [], hydration: [NASA, CHEF], description: "How engineers test spacecraft parachutes #nasa #space" });
+  check("hydration items work when the tap missed", resolved.id === NASA.id && resolved.author === "nasa");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

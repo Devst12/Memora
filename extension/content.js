@@ -122,68 +122,89 @@ function activeVideo() {
   return best;
 }
 
-// Climb from the active video through its ancestors looking for identity: a link to
-// /@user/video/<digits> (carries both author and id) or a long digit id in an attribute.
-// TikTok's 64-bit video ids are 18-19 digits; anything shorter is a false positive.
-function identityFromDom(video) {
-  const VIDEO_PATH = /\/@([^/?#]+)\/video\/(\d{17,20})/;
-  const BARE_ID = /(\d{17,20})/;
-  let node = video;
-  for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
-    const link = node.closest?.("a[href*='/video/']") || node.querySelector?.("a[href*='/video/']");
-    if (link) {
-      const match = (link.getAttribute("href") || "").match(VIDEO_PATH);
-      if (match) return { author: match[1], id: match[2] };
-    }
-    for (const attribute of ["id", "data-e2e", "data-video-id"]) {
-      const value = node.getAttribute?.(attribute) || "";
-      if (attribute === "data-e2e") continue; // Names like "video-card-123" are UI labels, not ids.
-      const match = value.match(BARE_ID);
-      if (match) {
-        // No author here — the hydration JSON below usually fills it; otherwise the save waits.
-        return { author: null, id: match[1] };
-      }
-    }
+// ---- Identity sources, best first ---------------------------------------------------------
+// 1. Address bar on a real video page (/@user/video/<id>) — exact.
+// 2. React props of the active <video> (asked from inject.js in the page's own JS world) — exact.
+// 3. Feed-API items seen by inject.js, matched to the on-screen author + caption — good.
+// 4. The <a href="/@user/video/<id>"> inside the active video's own feed card — sometimes present.
+// The old hydration-JSON lookup is gone: on the feed it only describes the first video loaded.
+
+const VIDEO_ID = /^\d{17,20}$/;
+const tapItems = new Map(); // id -> { author, id, caption } from feed API responses
+
+window.addEventListener("memora-tiktok-item", (event) => {
+  try {
+    const item = typeof event.detail === "string" ? JSON.parse(event.detail) : event.detail;
+    if (item?.id && VIDEO_ID.test(item.id)) tapItems.set(item.id, item);
+  } catch { /* Malformed announcement; ignore. */ }
+});
+// inject.js runs at document_start, this script at document_idle: ask for anything already seen.
+window.dispatchEvent(new CustomEvent("memora-tiktok-replay"));
+
+function identityFromLocation() {
+  const match = location.pathname.match(/^\/@([^/]+)\/video\/(\d{17,20})/);
+  return match ? { author: match[1], id: match[2] } : null;
+}
+
+function identityFromReact(video) {
+  if (!video) return null;
+  let raw = "";
+  const onResolved = (event) => { raw = event.detail || ""; };
+  window.addEventListener("memora-tiktok-resolved", onResolved);
+  video.setAttribute("data-memora-active", "1");
+  try { window.dispatchEvent(new CustomEvent("memora-tiktok-resolve")); }
+  finally {
+    video.removeAttribute("data-memora-active");
+    window.removeEventListener("memora-tiktok-resolved", onResolved);
   }
+  try {
+    const item = raw ? JSON.parse(raw) : null;
+    if (item?.id && VIDEO_ID.test(item.id)) return item;
+  } catch { /* Fall through to the next source. */ }
   return null;
 }
 
-// Feed pages embed the active video's hydration JSON with the canonical path and caption.
-function identityFromHydration() {
-  for (const script of document.querySelectorAll("script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script#SIGI_STATE")) {
-    try {
-      const data = JSON.parse(script.textContent || "");
-      const modules = data.__DEFAULT_SCOPE__?.["webapp.video-detail"]?.itemInfo?.itemStruct
-        ? [data.__DEFAULT_SCOPE__["webapp.video-detail"].itemInfo.itemStruct]
-        : Object.values(data.ItemModule || {});
-      for (const item of modules) {
-        const author = item?.author?.uniqueId || item?.author?.uniqueID || null;
-        const videoId = item?.id || item?.video?.id || null;
-        if (videoId && /^\d{17,20}$/.test(String(videoId))) {
-          return { author, id: String(videoId), caption: item?.desc ? String(item.desc).slice(0, 300) : "" };
-        }
-      }
-    } catch { /* Malformed or unrelated script tag; try the next one. */ }
-  }
-  return null;
+function cardOf(video) {
+  return video?.closest("article, [data-e2e='recommend-list-item-container']") || video?.parentElement?.parentElement || null;
 }
 
-// Returns { url, title, id } for the video being watched, or { refused: true } when the feed
-// shows no resolvable video. Refusing beats saving tiktok.com junk the user can never reopen.
+function identityFromTap(video) {
+  const card = cardOf(video);
+  if (!card || !tapItems.size) return null;
+  const norm = (text) => String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const shownAuthor = norm(card.querySelector("[data-e2e='video-author-uniqueid'], [data-e2e='browse-username']")?.textContent).replace(/^@/, "");
+  const shownCaption = norm(card.querySelector("[data-e2e='video-desc'], [data-e2e='browse-video-desc']")?.textContent);
+  let best = null;
+  for (const item of tapItems.values()) {
+    if (shownAuthor && norm(item.author) !== shownAuthor) continue;
+    const caption = norm(item.caption);
+    if (shownCaption && caption && (shownCaption.startsWith(caption.slice(0, 30)) || caption.startsWith(shownCaption.slice(0, 30)))) return item;
+    if (!best && shownAuthor && !shownCaption && !caption) best = item;
+  }
+  return best;
+}
+
+function identityFromCardLink(video) {
+  const card = cardOf(video);
+  const href = card?.querySelector("a[href*='/video/']")?.getAttribute("href") || "";
+  const match = href.match(/\/@([^/?#]+)\/video\/(\d{17,20})/);
+  return match ? { author: match[1], id: match[2] } : null;
+}
+
+// Returns { url, title, id } for the video being watched, or { refused: true } when nothing
+// resolves. Refusing beats saving tiktok.com junk the user can never reopen.
 function currentFeedItem() {
   if (!isTikTok()) return null;
-  const fromDom = identityFromDom(activeVideo() || document.body) || {};
-  const fromJson = identityFromHydration();
-  // Hydration JSON reflects the last *navigated* video, not necessarily the one on screen, so a
-  // DOM id wins when both exist. The author is interchangeable between the two sources.
-  const id = fromDom.id || fromJson?.id || null;
-  if (!id) return { refused: true };
-  const author = fromDom.author || fromJson?.author || null;
+  const video = activeVideo();
+  const found = identityFromLocation() || identityFromReact(video) || identityFromTap(video) || identityFromCardLink(video);
+  if (!found?.id) return { refused: true };
+  const author = found.author || tapItems.get(found.id)?.author || null;
   if (!author) return { refused: true }; // Building /video/<id> without an author guesses wrong.
+  const caption = found.caption || tapItems.get(found.id)?.caption || "";
   return {
-    id,
-    url: `${location.origin}/@${author}/video/${id}`,
-    title: fromJson?.caption || document.querySelector("[data-e2e='browse-video-desc'], [itemprop='description']")?.textContent?.trim().slice(0, 300) || "",
+    id: found.id,
+    url: `${location.origin}/@${author}/video/${found.id}`,
+    title: caption || cardOf(video)?.querySelector("[data-e2e='video-desc'], [data-e2e='browse-video-desc']")?.textContent?.trim().slice(0, 300) || "",
   };
 }
 
