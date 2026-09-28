@@ -6,6 +6,7 @@ async function show() {
   const settings = await chrome.storage.local.get(["apiUrl", "token"]);
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   activeUrl = tab?.url || "";
+  tabTitle = tab?.title || "";
   const connected = Boolean(settings.apiUrl && settings.token);
   config.hidden = connected; capture.hidden = !connected;
   if (connected) {
@@ -14,7 +15,7 @@ async function show() {
     const response = await fetch(`${settings.apiUrl}/api/taxonomy/categories`, { headers: { Authorization: `Bearer ${settings.token}` } });
     if (response.ok) {
       const { items } = await response.json();
-      $("category").replaceChildren(new Option("No category", ""), ...(items || []).map((item) => new Option(item.name, item.id)));
+      $("category").replaceChildren(new Option("Auto-detect", ""), ...(items || []).map((item) => new Option(item.name, item.id)));
     }
   } else {
     $("apiUrl").value = settings.apiUrl || "";
@@ -24,6 +25,21 @@ async function show() {
 
 $("settings").addEventListener("click", async () => { await chrome.storage.local.remove(["token"]); message.textContent = "Enter your new capture token."; await show(); });
 let connecting = false;
+// Same idea as the content script: keywords from the live tab help categorize SPA pages (TikTok
+// renders client-side, so the server-side fetch sees almost nothing).
+let tabTitle = "";
+function pageKeywords() {
+  const words = new Set();
+  const add = (value) => {
+    for (const word of String(value || "").toLowerCase().replace(/[^\p{L}\p{N} ]+/gu, " ").split(/\s+/)) {
+      if (word.length >= 3 && word.length <= 24 && words.size < 12) words.add(word);
+    }
+  };
+  document.querySelectorAll("h1, h2, [itemprop='keywords'], meta[name='keywords']").forEach((el) => {
+    add(el.getAttribute?.("content") || el.textContent);
+  });
+  return [...words].slice(0, 12);
+}
 $("connect").addEventListener("click", async () => {
   if (connecting) return;
   const apiUrl = $("apiUrl").value.trim().replace(/\/$/, ""), token = $("token").value.trim();
@@ -53,7 +69,7 @@ $("save").addEventListener("click", async () => {
   button.disabled = true; button.textContent = "Saving…"; message.textContent = "";
   try {
     if (!activeUrl || !/^https?:/i.test(activeUrl)) throw new Error("This page can't be saved (browser pages aren't saveable).");
-    const response = await fetch(`${apiUrl}/api/extension/capture`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ url: activeUrl, title: $("title").value, reason: $("reason").value, categoryId: $("category").value, notes: $("notes").value }) });
+    const response = await fetch(`${apiUrl}/api/extension/capture`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ url: activeUrl, title: $("title").value, pageTitle: tabTitle, keywords: pageKeywords(), reason: $("reason").value, categoryId: $("category").value, notes: $("notes").value }) });
     const result = await response.json();
     if (response.status === 409) message.textContent = "Already in your memory ✓";
     else if (!response.ok) throw new Error(result.error || "Couldn’t save right now.");
