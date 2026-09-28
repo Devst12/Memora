@@ -53,6 +53,10 @@ MongoDB collections and indexes are created on first use. User-specific default 
 
 Auto-categorization is deterministic keyword scoring in `lib/auto-tags.ts`: it matches page text against your own categories and picks a reason (Watch Later for video platforms, Learn for docs/repositories, and so on), generating up to five tags from the title and domain. Explicit fields from the popup always win over suggestions. Duplicate captures return HTTP 409 and the toast shows “Already in your memory” instead of erroring.
 
+**Auto-save rules** (Settings → Auto-save rules) let you map keywords to categories — e.g. `react, next.js → Web Development`. The first rule whose keyword appears in the link's URL, title, or live page text wins and outranks the built-in heuristics. The extension sends the real tab URL (resolved via `chrome.tabs`, so SPA feeds like TikTok are saved as the video you're actually watching, never a bare `tiktok.com`) plus visible page headings and hashtags as context keywords.
+
+TikTok links are canonicalized server-side (`lib/content.ts`): `vm.tiktok.com/XYZ`, `tiktok.com/t/XYZ`, `m.tiktok.com/v/@user/video/123.html`, and `www.tiktok.com/@user/video/123?is_from_webapp=1…` all collapse to one address per video, so the same video saved from different share forms is recognized as a duplicate instead of polluting your memory.
+
 The extension token grants save-only access. Treat it like a password. Revoke it if the extension profile or device is shared or lost.
 
 ## API
