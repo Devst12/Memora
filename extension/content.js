@@ -1,5 +1,7 @@
 // Floating "Save to Memora" side button injected into every page.
 // One click saves the current page (or right-clicked link) instantly with an on-screen toast.
+// The background resolves the real tab URL via chrome.tabs — required for SPA sites like
+// TikTok where location.href can be a stale or bare address — and gathers page keywords.
 
 const HOST_ID = "memora-float-root";
 const TOAST_MS = 3500;
@@ -7,6 +9,8 @@ const EDGE_MARGIN = 18;
 
 let shadowRoot = null;
 let hideTimer = null;
+let saveTimer = null;
+let fabTop = null; // Persisted vertical position so the toast follows a dragged button.
 
 function ensureShadow() {
   const existing = document.getElementById(HOST_ID);
@@ -35,7 +39,7 @@ function ensureShadow() {
   `;
   shadowRoot.appendChild(style);
   return { host, root: shadowRoot };
-}let fabTop = null; // Persisted vertical position so the toast follows a dragged button.
+}
 
 function showToast(title, meta, thumb) {
   const { root } = ensureShadow();
@@ -62,7 +66,6 @@ function showToast(title, meta, thumb) {
   root.appendChild(toast);
   requestAnimationFrame(() => toast.classList.add("show"));
   if (hideTimer) clearTimeout(hideTimer);
-  if (saveTimer) clearTimeout(saveTimer);
   hideTimer = setTimeout(() => {
     toast.classList.remove("show");
     setTimeout(() => toast.remove(), 250);
@@ -84,21 +87,39 @@ function describe(result) {
   return [result.platform, chips].filter(Boolean).join(" · ");
 }
 
-let saveTimer = null;
+// Visible words from the live page that static metadata fetching can't see (SPAs render
+// client-side). Headings, meta keywords, and hashtags give the categorizer real context.
+function pageKeywords() {
+  const words = new Set();
+  const add = (value) => {
+    for (const word of String(value || "").toLowerCase().replace(/[^\p{L}\p{N} ]+/gu, " ").split(/\s+/)) {
+      if (word.length >= 3 && word.length <= 24 && words.size < 12) words.add(word);
+    }
+  };
+  document.querySelectorAll("h1, h2, [itemprop='keywords'], meta[name='keywords']").forEach((el) => {
+    add(el.getAttribute?.("content") || el.textContent);
+  });
+  for (const match of document.title.matchAll(/#(\w{3,24})/g)) add(match[1]);
+  return [...words].slice(0, 12);
+}
+
 async function saveCurrentTarget(linkUrl) {
   if (saveTimer) return; // A save is already running; ignore repeat clicks until it settles.
-  const url = linkUrl || location.href;
-  const title = document.title || url.replace(/^https?:\/\//, "").split("/")[0];
   setFab("busy");
   try {
-    const result = await chrome.runtime.sendMessage({ type: "memora-save", url, title });
+    const result = await chrome.runtime.sendMessage({
+      type: "memora-save",
+      url: linkUrl || null, // null = let the background resolve the real tab URL
+      title: document.title || "",
+      keywords: pageKeywords(),
+    });
     if (!result || !result.ok) {
       setFab("err");
       showToast(result?.message || "Couldn't save this page.", "Check your connection or open the Memora popup to reconnect.");
     } else {
       setFab(result.duplicate ? "idle" : "ok");
       showToast(
-        result.duplicate ? result.title || "Already saved" : result.title || url,
+        result.duplicate ? result.title || "Already saved" : result.title || "Saved",
         (result.duplicate ? "Already in your memory · " : "Saved · ") + describe(result),
         result.thumbnailUrl
       );
