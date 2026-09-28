@@ -1,0 +1,65 @@
+const $ = (id) => document.getElementById(id);
+const config = $("config"), capture = $("capture"), message = $("message");
+let activeUrl = "";
+
+async function show() {
+  const settings = await chrome.storage.local.get(["apiUrl", "token"]);
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  activeUrl = tab?.url || "";
+  const connected = Boolean(settings.apiUrl && settings.token);
+  config.hidden = connected; capture.hidden = !connected;
+  if (connected) {
+    $("url").textContent = activeUrl;
+    $("title").value = tab?.title || "";
+    const response = await fetch(`${settings.apiUrl}/api/taxonomy/categories`, { headers: { Authorization: `Bearer ${settings.token}` } });
+    if (response.ok) {
+      const { items } = await response.json();
+      $("category").replaceChildren(new Option("No category", ""), ...(items || []).map((item) => new Option(item.name, item.id)));
+    }
+  } else {
+    $("apiUrl").value = settings.apiUrl || "";
+    if (!settings.apiUrl) message.textContent = "Paste your Memora app URL and capture token from Settings → Browser extension.";
+  }
+}
+
+$("settings").addEventListener("click", async () => { await chrome.storage.local.remove(["token"]); message.textContent = "Enter your new capture token."; await show(); });
+let connecting = false;
+$("connect").addEventListener("click", async () => {
+  if (connecting) return;
+  const apiUrl = $("apiUrl").value.trim().replace(/\/$/, ""), token = $("token").value.trim();
+  const button = $("connect");
+  try {
+    const parsed = new URL(apiUrl);
+    if (!(["https:", "http:"].includes(parsed.protocol)) || !token.startsWith("mem_")) throw new Error("Enter your Memora URL and capture token.");
+    connecting = true;
+    button.disabled = true; button.textContent = "Connecting…";
+    const granted = await chrome.permissions.request({ origins: [`${parsed.origin}/*`] });
+    if (!granted) throw new Error("Allow Memora access to connect the extension.");
+    await chrome.storage.local.set({ apiUrl, token });
+    const check = await fetch(`${apiUrl}/api/extension-token`, { headers: { Authorization: `Bearer ${token}` } });
+    if (check.status === 401) throw new Error("That token is invalid or revoked.");
+    if (!check.ok) throw new Error(`Couldn't reach ${apiUrl}. Is the app running?`);
+    message.textContent = "";
+    await show();
+  } catch (error) {
+    message.textContent = error.message || "Couldn’t connect. Check the app URL.";
+  } finally {
+    connecting = false;
+    button.disabled = false; button.textContent = "Connect";
+  }
+});
+$("save").addEventListener("click", async () => {
+  const button = $("save"), { apiUrl, token } = await chrome.storage.local.get(["apiUrl", "token"]);
+  button.disabled = true; button.textContent = "Saving…"; message.textContent = "";
+  try {
+    if (!activeUrl || !/^https?:/i.test(activeUrl)) throw new Error("This page can't be saved (browser pages aren't saveable).");
+    const response = await fetch(`${apiUrl}/api/extension/capture`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ url: activeUrl, title: $("title").value, reason: $("reason").value, categoryId: $("category").value, notes: $("notes").value }) });
+    const result = await response.json();
+    if (response.status === 409) message.textContent = "Already in your memory ✓";
+    else if (!response.ok) throw new Error(result.error || "Couldn’t save right now.");
+    else message.textContent = `✓ Saved${result.categoryName ? ` · ${result.categoryName}` : ""}${result.reason ? ` · ${result.reason}` : ""}`;
+    if (response.ok) button.textContent = "Saved";
+  } catch (error) { message.textContent = error.message || "Couldn’t save. Check your connection and try again."; }
+  finally { button.disabled = false; if (button.textContent === "Saving…") button.textContent = "Save to Memory"; }
+});
+show();
