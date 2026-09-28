@@ -2,6 +2,7 @@
 // Deterministic keyword scoring against the user's own taxonomy — no network calls, no AI.
 
 export type AutoSuggestion = { reason: string; categoryName: string | null; tags: string[] };
+export type CategoryRule = { categoryName: string; keywords: string[] };
 
 const VIDEO_REASON = "Watch Later";
 const LEARN_REASON = "Learn";
@@ -46,22 +47,42 @@ function rootDomain(url: string) {
   }
 }
 
-export function suggestMeta(input: { url: string; title?: string; description?: string; platform?: string; categories?: string[] }): AutoSuggestion {
-  const text = `${input.url} ${input.title || ""} ${input.description || ""}`.toLowerCase().slice(0, 4000);
+// Rules the user defined in Settings (category → keywords). One keyword hit is a strong,
+// deterministic signal and beats the built-in heuristics — ties go to the earliest rule.
+function ruleMatch(text: string, rules: CategoryRule[]): CategoryRule | null {
+  for (const rule of rules) {
+    for (const rawKeyword of rule.keywords) {
+      const keyword = rawKeyword.trim().toLowerCase();
+      if (keyword.length < 2) continue;
+      if (text.includes(keyword)) return rule;
+    }
+  }
+  return null;
+}
+
+export function suggestMeta(input: { url: string; title?: string; description?: string; platform?: string; categories?: string[]; rules?: CategoryRule[]; keywords?: string[] }): AutoSuggestion {
+  // Extra words the capturer saw in the live page (page keywords/headings) — they carry real
+  // context that static metadata misses, so they weigh in on category and reason too.
+  const contextWords = (input.keywords || []).join(" ");
+  const text = `${input.url} ${contextWords} ${input.title || ""} ${input.description || ""}`.toLowerCase().slice(0, 4000);
 
   let reason = ["youtube", "tiktok", "instagram", "facebook"].includes(input.platform || "") ? VIDEO_REASON : LEARN_REASON;
   for (const [pattern, value] of URL_REASON_HINTS) {
     if (pattern.test(text)) { reason = value; break; }
   }
 
+  const matchedRule = ruleMatch(text, input.rules || []);
+  if (matchedRule) return { reason, categoryName: matchedRule.categoryName, tags: tagsFor(input, text) };
+
   let categoryName: string | null = null, bestScore = 0;
+  const categoryText = `${input.url} ${input.title || ""} ${input.description || ""}`.toLowerCase().slice(0, 4000); // Heuristics stay on static metadata; rules already saw live keywords.
   for (const name of input.categories || []) {
     let score = 0;
     for (const [pattern, words] of CATEGORY_HINTS) {
       if (!pattern.test(name)) continue;
-      for (const word of words) if (text.includes(word)) score += 2;
+      for (const word of words) if (categoryText.includes(word)) score += 2;
     }
-    for (const word of keywordsFor(name)) if (word.length >= 3 && text.includes(word)) score += 2;
+    for (const word of keywordsFor(name)) if (word.length >= 3 && categoryText.includes(word)) score += 2;
     if (score > bestScore) { bestScore = score; categoryName = name; }
   }
 
@@ -73,5 +94,16 @@ export function suggestMeta(input: { url: string; title?: string; description?: 
     if (tags.length >= 5) break;
   }
 
-  return { reason, categoryName, tags };
+  return { reason, categoryName, tags: tagsFor(input, text) };
+}
+
+function tagsFor(input: { url: string; title?: string }, text: string) {
+  const tags: string[] = [];
+  const host = rootDomain(input.url);
+  if (host && host.length >= 3) tags.push(host);
+  for (const word of text.replace(/https?:\/\/\S+/g, " ").replace(/[^\p{L}\p{N} ]+/gu, " ").split(/\s+/)) {
+    if (word.length >= 3 && word.length <= 20 && !STOPWORDS.has(word) && !tags.includes(word)) tags.push(word);
+    if (tags.length >= 5) break;
+  }
+  return tags;
 }
