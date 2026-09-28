@@ -31,9 +31,15 @@ export async function POST(request: Request) {
       }
     }
     const platform = detectPlatform(normalized);
+    const keywords = Array.isArray(body.keywords) ? body.keywords.map((x: unknown) => safeText(x, 60)).filter(Boolean).slice(0, 12) : [];
     const title = safeText(body.title, 300) || metadata.title || new URL(normalized).hostname;
+    // Words the capturer saw in the live tab (title already on screen, visible headings, meta
+    // keywords). TikTok-style SPAs hide their real content behind client rendering — these hints
+    // recover the context the static fetch can't see. The tab's live title outranks fetched one.
+    const pageTitle = safeText(body.pageTitle, 300) || title;
     const categories = (await db.collection("categories").find({ userId: user._id }).project({ name: 1, _id: 0 }).toArray()).map(({ name }) => name);
-    const suggestion = suggestMeta({ url: normalized, title, description: metadata.description, platform, categories });
+    const rules = (await db.collection("category_rules").find({ userId: user._id }).sort({ createdAt: 1 }).toArray()).map(({ categoryName, keywords: ruleKeywords }) => ({ categoryName, keywords: Array.isArray(ruleKeywords) ? ruleKeywords : [] }));
+    const suggestion = suggestMeta({ url: normalized, title: pageTitle, description: metadata.description, platform, categories, rules, keywords });
     const explicitCategory = ObjectId.isValid(body.categoryId) ? await db.collection("categories").findOne({ _id: new ObjectId(body.categoryId), userId: user._id }) : null;
     if (body.categoryId && ObjectId.isValid(body.categoryId) && !explicitCategory) return jsonError("Choose one of your categories.");
     let category = explicitCategory;
