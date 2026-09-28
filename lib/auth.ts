@@ -56,7 +56,15 @@ export async function clearSession() {
   jar.delete(COOKIE);
 }
 
-export async function currentUser() {
+export async function currentUser(request?: Request) {
+  const authorization = request?.headers.get("authorization");
+  if (authorization?.startsWith("Bearer ")) {
+    const rawToken = authorization.slice(7);
+    if (rawToken.length < 30 || rawToken.length > 200) return null;
+    const db = await database(), tokenHash = createHmac("sha256", secret()).update(rawToken).digest("hex");
+    const token = await db.collection("extension_tokens").findOne({ tokenHash, revokedAt: null });
+    return token ? db.collection("users").findOne({ _id: token.userId }, { projection: { passwordHash: 0 } }) : null;
+  }
   const raw = (await cookies()).get(COOKIE)?.value;
   if (!raw) return null;
   const [token, signature, id] = raw.split(".");
@@ -75,4 +83,10 @@ export async function requireUser() {
   const user = await currentUser();
   if (!user) throw new Response("Unauthorized", { status: 401 });
   return user;
+}
+
+export async function createExtensionToken(userId: ObjectId) {
+  const db = await database(), token = `mem_${randomBytes(32).toString("base64url")}`;
+  await db.collection("extension_tokens").insertOne({ userId, tokenHash: createHmac("sha256", secret()).update(token).digest("hex"), createdAt: new Date(), revokedAt: null });
+  return token;
 }
