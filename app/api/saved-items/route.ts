@@ -2,6 +2,7 @@ import { ObjectId } from "mongodb";
 import { currentUser } from "@/lib/auth";
 import { database } from "@/lib/db";
 import { detectPlatform, fetchMetadata, normalizeUrl } from "@/lib/content";
+import { suggestMeta } from "@/lib/auto-tags";
 import { handleError, jsonError, safeText } from "@/lib/http";
 
 export async function GET(request: Request) {
@@ -54,9 +55,18 @@ export async function POST(request: Request) {
     const canonicalDuplicate = canonicalUrl !== normalized && await collection.findOne({ userId: user._id, canonicalUrl });
     if (canonicalDuplicate) return Response.json({ duplicate: true, item: serialize(canonicalDuplicate), message: "This is already in your memory." }, { status: 409 });
     const categoryId = ObjectId.isValid(body.categoryId) ? new ObjectId(body.categoryId) : null;
-    const category = categoryId ? await db.collection("categories").findOne({ _id: categoryId, userId: user._id }) : null;
+    let category = categoryId ? await db.collection("categories").findOne({ _id: categoryId, userId: user._id }) : null;
     if (categoryId && !category) return jsonError("Choose one of your categories.");
     const tags = Array.isArray(body.tags) ? [...new Set(body.tags.map((x: unknown) => safeText(x, 40).replace(/^#/, "").toLowerCase()).filter(Boolean))].slice(0, 12) : [];
+    // No explicit category? Fall back to the same rule engine the extension uses, so a link gets
+    // the same category however it was saved.
+    if (!category) {
+      const rules = await db.collection("category_rules").find({ userId: user._id }).sort({ createdAt: 1 }).toArray();
+      if (rules.length) {
+        const suggestion = suggestMeta({ url: normalized, title: safeText(body.title, 300) || metadata.title || "", description: metadata.description, rules: rules.map(({ categoryName, keywords }) => ({ categoryName, keywords: Array.isArray(keywords) ? keywords : [] })) });
+        if (suggestion.categoryName) category = await db.collection("categories").findOne({ userId: user._id, name: suggestion.categoryName });
+      }
+    }
     const now = new Date();
     const reminderAt = body.reminderAt ? new Date(body.reminderAt) : null;
     if (reminderAt && (!Number.isFinite(reminderAt.getTime()) || reminderAt <= now)) return jsonError("Choose a reminder in the future.");
