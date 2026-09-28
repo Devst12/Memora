@@ -6,6 +6,17 @@ import { suggestMeta } from "@/lib/auto-tags";
 import { handleError, jsonError, safeText } from "@/lib/http";
 import { rateLimited } from "@/lib/rate-limit";
 
+// Platform roots (tiktok.com/, youtube.com/, instagram.com/…) aren't a specific video or post —
+// they're the feed home. Saving one produces a card the user can never reopen meaningfully, so
+// the capture endpoint refuses them; the extension now detects the real item instead.
+const PLATFORM_ROOTS = new Set(["youtube.com", "tiktok.com", "instagram.com", "facebook.com", "reddit.com"]);
+function isPlatformRoot(normalizedUrl: string) {
+  try {
+    const url = new URL(normalizedUrl);
+    return PLATFORM_ROOTS.has(url.hostname.replace(/^www\./, "")) && (url.pathname === "/" || url.pathname === "");
+  } catch { return false; }
+}
+
 // One-shot capture for the floating side button: fetch metadata, infer reason/category/tags, save.
 // Explicit fields from the popup form still win when provided; everything else is automatic.
 export async function POST(request: Request) {
@@ -15,6 +26,7 @@ export async function POST(request: Request) {
     if (await rateLimited(request, `capture:${user._id.toHexString()}`, 60, 60 * 60 * 1000)) return jsonError("Too many saves in one hour. Try again later.", 429);
     const body = await request.json(); let normalized: string;
     try { normalized = normalizeUrl(body.url); } catch { return jsonError("Please enter a valid URL."); }
+    if (isPlatformRoot(normalized)) return jsonError("That's the platform's home page, not a specific video. Open a video and save that.");
     const db = await database(), coll = db.collection("saved_items");
     const duplicate = await coll.findOne({ userId: user._id, canonicalUrl: normalized });
     if (duplicate) {
