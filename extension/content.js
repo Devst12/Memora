@@ -1,6 +1,7 @@
 // Floating "Save to Memora" side button injected into every page.
 // One click saves the current page (or right-clicked link) instantly with an on-screen toast.
-// The background resolves the real tab URL via chrome.tabs — required for SPA sites like
+// The button face is the Memora logo bundled with the extension; save state shows as a small
+// badge. The background resolves the real tab URL via chrome.tabs — required for SPA sites like
 // TikTok where location.href can be a stale or bare address — and gathers page keywords.
 
 const HOST_ID = "memora-float-root";
@@ -22,13 +23,17 @@ function ensureShadow() {
   shadowRoot = host.attachShadow({ mode: "closed" });
   const style = document.createElement("style");
   style.textContent = `
-    .m-fab{position:fixed;right:${EDGE_MARGIN}px;top:58%;width:46px;height:46px;border-radius:50%;border:1px solid rgba(255,255,255,.25);
-      background:linear-gradient(145deg,#3d5a44,#2c4032);color:#fff;font:700 20px/44px system-ui,sans-serif;text-align:center;cursor:pointer;
-      box-shadow:0 6px 20px rgba(0,0,0,.35);opacity:.82;transition:opacity .15s,transform .15s,background .15s;user-select:none;-webkit-user-select:none}
+    .m-fab{position:fixed;right:${EDGE_MARGIN}px;top:58%;width:46px;height:46px;border-radius:50%;border:1px solid rgba(255,255,255,.35);
+      background:rgba(28,34,26,.78);cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.35);opacity:.88;
+      transition:opacity .15s,transform .15s,background .15s;user-select:none;-webkit-user-select:none;padding:3px;box-sizing:border-box}
     .m-fab:hover{opacity:1;transform:scale(1.08)}
-    .m-fab.busy{opacity:1;pointer-events:none;background:#6b7280}
-    .m-fab.ok{background:linear-gradient(145deg,#4f7d58,#3a5c42)}
-    .m-fab.err{background:linear-gradient(145deg,#a35445,#7f4034)}
+    .m-fab img{width:100%;height:100%;border-radius:50%;display:block;object-fit:contain;pointer-events:none}
+    .m-fab.busy{opacity:1;pointer-events:none}
+    .m-fab.busy img{animation:m-pulse 1s ease-in-out infinite}
+    @keyframes m-pulse{0%,100%{opacity:.55}50%{opacity:1}}
+    .m-fab .m-badge{position:absolute;right:-2px;bottom:-2px;width:16px;height:16px;border-radius:50%;color:#fff;font:700 11px/16px system-ui,sans-serif;text-align:center;display:none;box-shadow:0 1px 4px rgba(0,0,0,.4)}
+    .m-fab.ok .m-badge{display:block;background:#4f7d58}
+    .m-fab.err .m-badge{display:block;background:#a35445}
     .m-toast{position:fixed;right:${EDGE_MARGIN + 8}px;top:calc(58% + 56px);max-width:320px;background:#20251f;color:#f3f4f1;border-radius:14px;
       padding:12px 14px;font:13px/1.45 system-ui,sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.4);opacity:0;transform:translateY(6px);
       transition:opacity .18s,transform .18s;pointer-events:none;display:flex;gap:10px;align-items:flex-start}
@@ -72,13 +77,15 @@ function showToast(title, meta, thumb) {
   }, TOAST_MS);
 }
 
-function setFab(state, glyph = "m") {
+function setFab(state) {
   const { root } = ensureShadow();
   const fab = root.getElementById("m-fab");
   if (!fab) return;
   fab.className = `m-fab${state === "idle" ? "" : ` ${state}`}`;
-  fab.textContent = state === "busy" ? "…" : state === "ok" ? "✓" : state === "err" ? "!" : glyph;
+  const badge = fab.querySelector(".m-badge");
+  if (badge) badge.textContent = state === "ok" ? "✓" : state === "err" ? "!" : "";
 }
+
 function describe(result) {
   const chips = [result.categoryName, result.reason, ...(result.tags || []).slice(0, 2)]
     .filter(Boolean)
@@ -141,7 +148,7 @@ function currentPageThumbnail() {
   try {
     const video = document.querySelector("video[poster]");
     if (video?.poster && /^https:\/\//.test(video.poster)) return video.poster;
-    const img = document.querySelector("img[src*='anime'], img[src*='thumbnail'], img[src*='/aweme/']");
+    const img = document.querySelector("img[src*='thumbnail'], img[src*='/aweme/']");
     const src = img?.getAttribute("src");
     if (src && /^https:\/\//.test(src)) return src;
   } catch { /* No thumbnail is fine — the card falls back to the platform icon. */ }
@@ -183,8 +190,14 @@ function mount() {
   const fab = document.createElement("div");
   fab.id = "m-fab";
   fab.className = "m-fab";
-  fab.textContent = "m";
   fab.title = "Save to Memora";
+  // The Memora logo (bundled with the extension) is the button face; a small badge shows save state.
+  const logo = document.createElement("img");
+  logo.src = chrome.runtime.getURL("icon48.png");
+  logo.alt = "";
+  const badge = document.createElement("span");
+  badge.className = "m-badge";
+  fab.append(logo, badge);
   // Drag vertically along the right edge so it never blocks content; a real drag must not trigger a save.
   let dragging = false, moved = false, startY = 0, startTop = 0;
   fab.addEventListener("pointerdown", (event) => {
