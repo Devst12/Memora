@@ -79,12 +79,31 @@ function setFab(state, glyph = "m") {
   fab.className = `m-fab${state === "idle" ? "" : ` ${state}`}`;
   fab.textContent = state === "busy" ? "…" : state === "ok" ? "✓" : state === "err" ? "!" : glyph;
 }
-
 function describe(result) {
   const chips = [result.categoryName, result.reason, ...(result.tags || []).slice(0, 2)]
     .filter(Boolean)
     .join("  ");
   return [result.platform, chips].filter(Boolean).join(" · ");
+}
+
+// On SPA feeds the address bar doesn't follow the video (TikTok keeps showing tiktok.com or a
+// bare profile while you swipe). Each site here exposes the current item's identity in its own
+// DOM — a share-link control, a canonical element, or player state — and that exact URL is what
+// should be saved. Every probe is wrapped in try/catch: a redesign degrades to the tab URL.
+function currentPageUrl() {
+  try {
+    const host = location.hostname.replace(/^www\./, "");
+    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
+      const copyField = document.querySelector("[data-e2e='copy-link-input']");
+      if (copyField?.value && /tiktok\.com/.test(copyField.value)) return copyField.value;
+      const video = document.querySelector("video[src*='/video/'], video source[src*='/video/']");
+      const match = (video?.src || "").match(/(?:@[^/]+)\/video\/(\d{6,25})/);
+      if (match) return `${location.origin}/@${(document.querySelector("[data-e2e='browse-username']")?.textContent || "user").replace(/^@/, "")}/video/${match[1]}`;
+      const canonical = document.querySelector("link[rel='canonical']")?.href || document.querySelector("meta[property='og:url']")?.content;
+      if (canonical && /\/video\/\d{6,}/.test(canonical)) return canonical;
+    }
+  } catch { /* Fall through to the plain tab URL. */ }
+  return null;
 }
 
 // Visible words from the live page that static metadata fetching can't see (SPAs render
@@ -103,15 +122,42 @@ function pageKeywords() {
   return [...words].slice(0, 12);
 }
 
+// The item's real title on SPA feeds lives in the page, not document.title (which stays
+// "TikTok - Make Your Day"). Probes stay site-specific and best-effort.
+function currentPageTitle() {
+  try {
+    const host = location.hostname.replace(/^www\./, "");
+    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
+      const h1 = document.querySelector("[data-e2e='browse-video-desc'], [itemprop='description']");
+      if (h1?.textContent?.trim()) return h1.textContent.trim().slice(0, 300);
+    }
+  } catch { /* Fall through to document.title. */ }
+  return document.title || "";
+}
+
+// The rendered video's poster frame — the server can't fetch TikTok previews, but the page
+// already has the image loaded, so send it along for the card thumbnail.
+function currentPageThumbnail() {
+  try {
+    const video = document.querySelector("video[poster]");
+    if (video?.poster && /^https:\/\//.test(video.poster)) return video.poster;
+    const img = document.querySelector("img[src*='anime'], img[src*='thumbnail'], img[src*='/aweme/']");
+    const src = img?.getAttribute("src");
+    if (src && /^https:\/\//.test(src)) return src;
+  } catch { /* No thumbnail is fine — the card falls back to the platform icon. */ }
+  return "";
+}
+
 async function saveCurrentTarget(linkUrl) {
   if (saveTimer) return; // A save is already running; ignore repeat clicks until it settles.
   setFab("busy");
   try {
     const result = await chrome.runtime.sendMessage({
       type: "memora-save",
-      url: linkUrl || null, // null = let the background resolve the real tab URL
-      title: document.title || "",
+      url: linkUrl || currentPageUrl() || null, // null = let the background resolve the tab URL
+      title: currentPageTitle() || document.title || "",
       keywords: pageKeywords(),
+      thumbnailUrl: currentPageThumbnail(),
     });
     if (!result || !result.ok) {
       setFab("err");
@@ -175,6 +221,11 @@ function mount() {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "memora-ping") {
     sendResponse({ alive: true });
+    return;
+  }
+  // Popup asks for the current item's real URL/title on SPA pages before opening its form.
+  if (message?.type === "memora-context") {
+    sendResponse({ url: currentPageUrl(), title: currentPageTitle(), keywords: pageKeywords(), thumbnailUrl: currentPageThumbnail() });
     return;
   }
   // Background already saved (right-click menu): just show the outcome on screen.
