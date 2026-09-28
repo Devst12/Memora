@@ -28,6 +28,7 @@ export async function database(): Promise<Db> {
     db.collection("categories").createIndex({ userId: 1, name: 1 }, { unique: true }),
     db.collection("tags").createIndex({ userId: 1, name: 1 }, { unique: true }),
     db.collection("reasons").createIndex({ userId: 1, name: 1 }, { unique: true }),
+    db.collection("category_rules").createIndex({ userId: 1, createdAt: 1 }),
   ]).then(() => undefined);
   await cache.indexes;
   return db;
