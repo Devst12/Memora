@@ -1,4 +1,6 @@
 // Service worker: performs saves for the floating button and right-click menu, tracks badge feedback.
+// The content script never trusts location.href — SPA sites like TikTok keep the address bar
+// stale or bare (tiktok.com while scrolling a feed), so the real URL is resolved here per tab.
 
 async function capture({ apiUrl, token }, payload) {
   const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/extension/capture`, {
@@ -11,13 +13,32 @@ async function capture({ apiUrl, token }, payload) {
   return { status: response.status, body };
 }
 
-async function save(url, title) {
+// Resolve the address to save: an explicit link (right-click) wins; otherwise ask Chrome for the
+// tab's live URL and title. activeTab permission grants this on the tab the user is on.
+async function resolveTab(url, sender) {
+  if (url) return { url, title: "" };
+  const tabId = sender?.tab?.id;
+  if (tabId == null) return null;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.url || !/^https?:/i.test(tab.url)) return null;
+    return { url: tab.url, title: tab.title || "" };
+  } catch { return null; }
+}
+
+async function save({ url: rawUrl, title: pageTitle, keywords }, sender) {
   const { apiUrl, token } = await chrome.storage.local.get(["apiUrl", "token"]);
   if (!apiUrl || !token) {
     return { ok: false, message: "Memora isn't connected. Open the popup to add your app URL and capture token." };
   }
+  const resolved = await resolveTab(rawUrl, sender);
+  if (!resolved) return { ok: false, message: "This page can't be saved." };
   try {
-    const { status, body } = await capture({ apiUrl, token }, { url, title });
+    const { status, body } = await capture({ apiUrl, token }, {
+      url: resolved.url,
+      pageTitle,
+      keywords: Array.isArray(keywords) ? keywords : [],
+    });
     if (status === 409) {
       return { ok: true, duplicate: true, title: body.title, platform: body.platform, thumbnailUrl: body.thumbnailUrl, message: body.message };
     }
@@ -30,9 +51,9 @@ async function save(url, title) {
   }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === "memora-save" && typeof message.url === "string") {
-    save(message.url, typeof message.title === "string" ? message.title : "").then(sendResponse);
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "memora-save") {
+    save(message, sender).then(sendResponse);
     return true; // keep the message channel open for the async response
   }
 });
@@ -43,9 +64,7 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== "memora-save") return;
-  const url = info.linkUrl || info.pageUrl || tab?.url;
-  if (!url) return;
-  const result = await save(url, tab?.title || "");
+  const result = await save({ url: info.linkUrl || info.pageUrl || null, title: tab?.title || "", keywords: [] }, { tab });
   const ok = result.ok && !result.duplicate;
   await chrome.action.setBadgeBackgroundColor({ color: ok ? "#526b4b" : "#995f4f" });
   await chrome.action.setBadgeText({ text: ok ? "✓" : "!" });
