@@ -103,6 +103,19 @@ function currentPageUrl() {
     if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
       const copyField = document.querySelector("[data-e2e='copy-link-input']");
       if (copyField?.value && /tiktok\.com/.test(copyField.value)) return copyField.value;
+      // Feed pages embed the active video's own JSON (itemInfo / SIGI_STATE) with the canonical
+      // @user/video/<id> path — the strongest signal when the share dialog is closed.
+      for (const script of document.querySelectorAll("script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script#SIGI_STATE")) {
+        try {
+          const data = JSON.parse(script.textContent || "");
+          const modules = data.__DEFAULT_SCOPE__?.["webapp.video-detail"]?.itemInfo?.itemStruct || data.ItemModule || {};
+          for (const item of Object.values(modules)) {
+            const author = item?.author?.uniqueId || item?.author?.uniqueID;
+            const videoId = item?.id || item?.video?.id;
+            if (author && videoId) return `${location.origin}/@${author}/video/${videoId}`;
+          }
+        } catch { /* Malformed or unrelated script tag; try the next probe. */ }
+      }
       const video = document.querySelector("video[src*='/video/'], video source[src*='/video/']");
       const match = (video?.src || "").match(/(?:@[^/]+)\/video\/(\d{6,25})/);
       if (match) return `${location.origin}/@${(document.querySelector("[data-e2e='browse-username']")?.textContent || "user").replace(/^@/, "")}/video/${match[1]}`;
@@ -137,6 +150,17 @@ function currentPageTitle() {
     if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
       const h1 = document.querySelector("[data-e2e='browse-video-desc'], [itemprop='description']");
       if (h1?.textContent?.trim()) return h1.textContent.trim().slice(0, 300);
+      // Same embedded JSON that carries the video id also carries the real caption.
+      for (const script of document.querySelectorAll("script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script#SIGI_STATE")) {
+        try {
+          const data = JSON.parse(script.textContent || "");
+          const modules = data.__DEFAULT_SCOPE__?.["webapp.video-detail"]?.itemInfo?.itemStruct || data.ItemModule || {};
+          for (const item of Object.values(modules)) {
+            const caption = item?.desc;
+            if (caption) return String(caption).slice(0, 300);
+          }
+        } catch { /* Malformed or unrelated script tag; try the next probe. */ }
+      }
     }
   } catch { /* Fall through to document.title. */ }
   return document.title || "";
