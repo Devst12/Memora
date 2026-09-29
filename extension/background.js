@@ -47,7 +47,7 @@ function hashtagWords(text) {
   return [...String(text || "").matchAll(/#([\p{L}\p{N}_]{2,24})/gu)].map((m) => m[1].toLowerCase());
 }
 
-async function save({ url: rawUrl, title: pageTitle, keywords, thumbnailUrl, author }, sender) {
+async function save({ url: rawUrl, title: pageTitle, keywords, thumbnailUrl, author, description }, sender) {
   const { apiUrl, token } = await chrome.storage.local.get(["apiUrl", "token"]);
   if (!apiUrl || !token) {
     return { ok: false, message: "Memora isn't connected. Open the popup to add your app URL and capture token." };
@@ -56,20 +56,22 @@ async function save({ url: rawUrl, title: pageTitle, keywords, thumbnailUrl, aut
   if (!resolved) return { ok: false, message: "This page can't be saved." };
 
   let title = GENERIC_TITLE.test(pageTitle || "") ? "" : pageTitle;
+  let desc = GENERIC_TITLE.test(description || "") ? "" : description || "";
   let thumb = thumbnailUrl || "";
   let by = author || "";
   // Only pay for the oEmbed call when the page didn't already give us a real caption.
   if (!title || !thumb || !by) {
     const details = await tiktokDetails(resolved.url);
-    if (details) { title = title || details.title; thumb = thumb || details.thumbnailUrl; by = by || details.author; }
+    if (details) { title = title || details.title; desc = desc || details.title; thumb = thumb || details.thumbnailUrl; by = by || details.author; }
   }
-  const words = [...new Set([...hashtagWords(title), ...(Array.isArray(keywords) ? keywords : [])])].slice(0, 16);
+  const words = [...new Set([...hashtagWords(title || desc), ...(Array.isArray(keywords) ? keywords : [])])].slice(0, 16);
 
   try {
     const { status, body } = await capture({ apiUrl, token }, {
       url: resolved.url,
-      pageTitle: title || pageTitle || resolved.title || "",
-      description: title || "",
+      title: title || resolved.title || "", // the actual saved title — server used to never get this
+      pageTitle: title || resolved.title || "", // context only, used for category guessing
+      description: desc,
       author: by,
       thumbnailUrl: thumb,
       keywords: words,

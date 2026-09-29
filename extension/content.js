@@ -106,6 +106,15 @@ function isTikTok() {
   return host === "tiktok.com" || host.endsWith(".tiktok.com");
 }
 
+function isDouyin() {
+  return /(^|\.)douyin\.com$/.test(location.hostname);
+}
+
+// Either of these is a ByteDance-style feed with no per-item URL by default.
+function isFeedPlatform() {
+  return isTikTok() || isDouyin();
+}
+
 // The <video> closest to the viewport center is the one the user is watching. Measured on
 // demand (no observers, no timers) — cheap and always current at click time.
 function activeVideo() {
@@ -141,8 +150,17 @@ window.addEventListener("memora-tiktok-item", (event) => {
 window.dispatchEvent(new CustomEvent("memora-tiktok-replay"));
 
 function identityFromLocation() {
-  const match = location.pathname.match(/^\/@([^/]+)\/video\/(\d{17,20})/);
-  return match ? { author: match[1], id: match[2] } : null;
+  const tiktok = location.pathname.match(/^\/@([^/]+)\/video\/(\d{17,20})/);
+  if (tiktok) return { author: tiktok[1], id: tiktok[2] };
+  // Douyin's direct video page needs no username: douyin.com/video/<id>.
+  const douyinPath = location.pathname.match(/^\/video\/(\d{17,20})/);
+  if (douyinPath) return { author: null, id: douyinPath[1] };
+  // Douyin's feed opens a video as an overlay without changing the path, but stamps the id
+  // into a modal_id query param (e.g. /?recommend=1&modal_id=712...). Confirmed via Douyin's
+  // own yt-dlp integration, which normalizes these same URLs before download.
+  const modalId = new URLSearchParams(location.search).get("modal_id");
+  if (modalId && /^\d{17,20}$/.test(modalId)) return { author: null, id: modalId };
+  return null;
 }
 
 function identityFromReact(video) {
@@ -207,26 +225,58 @@ function computeFeedItem() {
   const found = identityFromLocation() || identityFromReact(video) || identityFromTap(video) || identityFromCardLink(video);
   if (!found?.id) return { refused: true };
   const author = found.author || tapItems.get(found.id)?.author || null;
-  if (!author) return { refused: true }; // Building /video/<id> without an author guesses wrong.
+  // TikTok's canonical link needs the author in the path; Douyin's doesn't. Only TikTok refuses
+  // without one — building a wrong TikTok URL is worse than a Douyin link missing the author name.
+  if (isTikTok() && !author) return { refused: true };
   const caption = found.caption || tapItems.get(found.id)?.caption || "";
+  const url = isDouyin() ? `${location.origin}/video/${found.id}` : `${location.origin}/@${author}/video/${found.id}`;
   return {
     id: found.id,
     author,
-    url: `${location.origin}/@${author}/video/${found.id}`,
+    url,
     title: caption || cardOf(video)?.querySelector("[data-e2e='video-desc'], [data-e2e='browse-video-desc']")?.textContent?.trim().slice(0, 300) || "",
   };
 }
 
+// Public, stable permalink shapes these platforms use for "share this post" links. Unlike the
+// TikTok/Douyin feed work, this needs no DOM or React digging: the address bar already carries
+// the exact item the moment the user opens one directly (from search, a profile, a shared link,
+// or clicking into it from a feed). It only misses the case where someone never clicks in and
+// the URL never changes at all — raw infinite scroll — which is what the per-site work is for.
+const DIRECT_ITEM_PATTERNS = [
+  { host: /(^|\.)instagram\.com$/, path: /^\/(p|reel|reels|tv)\/[A-Za-z0-9_-]+/ },
+  { host: /(^|\.)(x|twitter)\.com$/, path: /^\/[^/]+\/status\/\d+/ },
+  { host: /(^|\.)facebook\.com$/, path: /^\/(watch\/|reel\/|[^/]+\/(videos|posts)\/)/ },
+  { host: /(^|\.)pinterest\.[a-z.]+$/, path: /^\/pin\/\d+/ },
+  { host: /(^|\.)reddit\.com$/, path: /^\/r\/[^/]+\/comments\/[a-z0-9]+/ },
+  { host: /(^|\.)linkedin\.com$/, path: /^\/(posts\/|feed\/update\/)/ },
+  { host: /(^|\.)threads\.net$/, path: /^\/@[^/]+\/post\/[A-Za-z0-9_-]+/ },
+];
+
+function directItemUrl() {
+  const matched = DIRECT_ITEM_PATTERNS.some((p) => p.host.test(location.hostname) && p.path.test(location.pathname));
+  if (!matched) return null;
+  // Tracking params (igshid, si, utm_*...) make the same post look like a new URL every time
+  // it's shared, so duplicate detection would never catch it. The item's own path already
+  // carries the id for every pattern above except Facebook's /watch/?v=<id>, so drop the query
+  // string everywhere else.
+  const idIsInQuery = /^\/watch\/?$/.test(location.pathname) && new URLSearchParams(location.search).has("v");
+  return idIsInQuery ? `${location.origin}${location.pathname}${location.search}` : `${location.origin}${location.pathname}`;
+}
+
 // Non-feed pages (a direct TikTok video URL, or any other site): the tab URL is the identity.
 function currentPageUrl() {
-  if (isTikTok()) {
+  const direct = directItemUrl();
+  if (direct) return direct;
+
+  if (isFeedPlatform()) {
     const feedItem = currentFeedItem();
     if (feedItem?.refused) return null;
     if (feedItem?.url) return feedItem.url;
   }
   try {
     const copyField = document.querySelector("[data-e2e='copy-link-input']");
-    if (copyField?.value && /tiktok\.com/.test(copyField.value)) return copyField.value;
+    if (copyField?.value && /(tiktok|douyin)\.com/.test(copyField.value)) return copyField.value;
     const canonical = document.querySelector("link[rel='canonical']")?.href || document.querySelector("meta[property='og:url']")?.content;
     if (canonical && /\/video\/\d{17,20}/.test(canonical)) return canonical;
   } catch { /* Fall through to the plain tab URL. */ }
@@ -246,6 +296,7 @@ function pageKeywords() {
     add(el.getAttribute?.("content") || el.textContent);
   });
   for (const match of document.title.matchAll(/#(\w{3,24})/g)) add(match[1]);
+  for (const match of pageMetaDescription().matchAll(/#(\w{3,24})/g)) add(match[1]);
   return [...words].slice(0, 12);
 }
 
@@ -253,7 +304,9 @@ function pageKeywords() {
 // "TikTok - Make Your Day"). Probes stay site-specific and best-effort.
 function currentPageTitle() {
   try {
-    if (isTikTok()) {
+    const structured = pageStructuredData();
+    if (directItemUrl() && structured?.title) return structured.title;
+    if (isFeedPlatform()) {
       const feedItem = currentFeedItem();
       if (feedItem?.title) return feedItem.title;
     }
@@ -270,8 +323,60 @@ function currentPageThumbnail() {
     const img = document.querySelector("img[src*='thumbnail'], img[src*='/aweme/']");
     const src = img?.getAttribute("src");
     if (src && /^https:\/\//.test(src)) return src;
+    const og = document.querySelector("meta[property='og:image'], meta[name='twitter:image']")?.getAttribute("content");
+    if (og && /^https:\/\//.test(og)) return og;
+    const structured = pageStructuredData();
+    if (structured?.thumbnailUrl && /^https:\/\//.test(structured.thumbnailUrl)) return structured.thumbnailUrl;
   } catch { /* No thumbnail is fine — the card falls back to the platform icon. */ }
   return "";
+}
+
+// General-purpose description/author for every site, not just TikTok. Most sites — even
+// JS-heavy ones a server-side fetch can't render — put these in <meta> tags the browser has
+// already parsed by the time this script runs, so reading them here works far more broadly
+// than trying to write a scraper per site.
+// Structured data (schema.org JSON-LD) is how search engines get exact facts about a page, so
+// most content platforms that care about SEO — YouTube, Pinterest, many news and shopping sites,
+// and plenty of others — embed it whether or not their normal meta tags are any good. Reading it
+// gives a real title/caption/author for pages the plain meta-tag pass alone would miss.
+function pageStructuredData() {
+  try {
+    for (const node of document.querySelectorAll('script[type="application/ld+json"]')) {
+      let parsed;
+      try { parsed = JSON.parse(node.textContent || ""); } catch { continue; }
+      for (const entry of Array.isArray(parsed) ? parsed : [parsed]) {
+        const type = String(entry?.["@type"] || "");
+        if (/VideoObject|ImageObject|Article|SocialMediaPosting|CreativeWork/i.test(type)) {
+          const author = entry.author?.name || (typeof entry.author === "string" ? entry.author : "") || entry.creator?.name || "";
+          return {
+            title: String(entry.name || entry.headline || "").trim().slice(0, 300),
+            description: String(entry.description || "").trim().slice(0, 2000),
+            author: String(author).trim().slice(0, 120),
+            thumbnailUrl: (Array.isArray(entry.thumbnailUrl) ? entry.thumbnailUrl[0] : entry.thumbnailUrl) || (Array.isArray(entry.image) ? entry.image[0] : entry.image) || "",
+          };
+        }
+      }
+    }
+  } catch { /* Not every site publishes this; the meta-tag pass still runs either way. */ }
+  return null;
+}
+
+function pageMetaDescription() {
+  try {
+    const structured = pageStructuredData();
+    if (structured?.description) return structured.description;
+    const el = document.querySelector("meta[property='og:description'], meta[name='twitter:description'], meta[name='description']");
+    return el?.getAttribute("content")?.trim().slice(0, 2000) || "";
+  } catch { return ""; }
+}
+
+function pageMetaAuthor() {
+  try {
+    const structured = pageStructuredData();
+    if (structured?.author) return structured.author;
+    const el = document.querySelector("meta[name='author'], meta[property='article:author'], meta[property='og:site_name']");
+    return el?.getAttribute("content")?.trim().slice(0, 120) || "";
+  } catch { return ""; }
 }
 
 // ---- Saving -------------------------------------------------------------------------------
@@ -281,7 +386,7 @@ async function saveCurrentTarget(linkUrl) {
   setFab("busy");
 
   // Right-clicked links save directly; feed pages need a stable, resolvable video identity.
-  if (!linkUrl && isTikTok()) {
+  if (!linkUrl && isFeedPlatform()) {
     const feedItem = currentFeedItem();
     if (feedItem?.refused) {
       if (lastSaveWasDuplicate && lastSavedFeedId) {
@@ -301,12 +406,13 @@ async function saveCurrentTarget(linkUrl) {
   }
 
   try {
-    const target = !linkUrl && isTikTok() ? currentFeedItem() : null;
+    const target = !linkUrl && isFeedPlatform() ? currentFeedItem() : null;
     const result = await chrome.runtime.sendMessage({
       type: "memora-save",
       url: linkUrl || target?.url || currentPageUrl() || null, // null = let the background resolve the tab URL
       title: target ? target.title : currentPageTitle() || document.title || "",
-      author: target?.author || "",
+      author: target?.author || pageMetaAuthor(),
+      description: target ? target.title : pageMetaDescription(),
       keywords: pageKeywords(),
       thumbnailUrl: currentPageThumbnail(),
     });
@@ -320,7 +426,7 @@ async function saveCurrentTarget(linkUrl) {
       showToast(result?.message || "Couldn't save this page.", "Check your connection or open the Memora popup to reconnect.");
     } else {
       setFab(result.duplicate ? "idle" : "ok");
-      if (!linkUrl && isTikTok()) {
+      if (!linkUrl && isFeedPlatform()) {
         const feedItem = currentFeedItem();
         if (feedItem?.id) {
           lastSavedFeedId = feedItem.id;
