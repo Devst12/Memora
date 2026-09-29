@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Inter } from "next/font/google";
 import { Toaster } from "sonner";
+import { DialogHost } from "@/components/confirm-dialog";
 import "./globals.css";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-app", display: "swap" });
@@ -29,6 +30,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           dangerouslySetInnerHTML={{ __html: `try{if(localStorage.getItem('memora-theme')==='dark')document.documentElement.classList.add('dark')}catch(e){}` }}
         />
         {children}
+        <DialogHost />
         <Toaster position="bottom-center" toastOptions={{ style: { borderRadius: "14px" } }} />
       </body>
     </html>
