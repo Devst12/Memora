@@ -14,12 +14,41 @@ type Item = { id: string; title: string; url: string; platform: string; descript
 type Taxonomy = { id: string; name: string };
 type Activity = { type: string; createdAt: string; itemId: string; title: string };
 const label: Record<string, string> = { youtube: "YouTube", tiktok: "TikTok", instagram: "Instagram", facebook: "Facebook", reddit: "Reddit", web: "Web" };
+// Sections the memory list is grouped into, newest first.
+const dateGroups = ["Today", "Yesterday", "This week", "This month", "This year", "Earlier"];
+function dateGroup(value: string) {
+  const saved = new Date(value), now = new Date();
+  const day = (d: Date) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime(); };
+  const diff = Math.round((day(now) - day(saved)) / 86400000);
+  if (diff <= 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  if (diff < 7) return "This week";
+  if (saved.getFullYear() === now.getFullYear() && saved.getMonth() === now.getMonth()) return "This month";
+  if (saved.getFullYear() === now.getFullYear()) return "This year";
+  return "Earlier";
+}
 
+// GETs get a 15s timeout and one automatic retry, so a slow or flaky server
+// surfaces an error instead of hanging. Writes are never retried to avoid
+// double-saving; the server's own duplicate check covers the edge anyway.
 async function api(path: string, options?: RequestInit) {
-  const response = await fetch(path, { ...options, headers: { "Content-Type": "application/json", ...options?.headers } });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok && response.status !== 409) throw new Error(body.error || "Something went wrong. Please try again.");
-  return { response, body };
+  const run = async (signal: AbortSignal) => {
+    const response = await fetch(path, { ...options, signal, headers: { "Content-Type": "application/json", ...options?.headers } });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok && response.status !== 409) throw new Error(body.error || "Something went wrong. Please try again.");
+    return { response, body };
+  };
+  const retryable = !options?.method || options.method === "GET";
+  for (let tries = 0; ; tries++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try { return await run(controller.signal); }
+    catch (error) {
+      const message = (error as Error).message || "";
+      const transient = (error as Error).name === "AbortError" || /failed to fetch|network|load failed/i.test(message);
+      if (!retryable || tries >= 1 || !transient) throw error;
+    } finally { clearTimeout(timer); }
+  }
 }
 
 export default function Dashboard() {
@@ -30,7 +59,7 @@ export default function Dashboard() {
   const [newCategory, setNewCategory] = useState(""), [extensionToken, setExtensionToken] = useState(""), [copied, setCopied] = useState(false);
   const [duplicateItem, setDuplicateItem] = useState<Item | null>(null);
   const [activity, setActivity] = useState<Activity[]>([]);
-  const [hasMore, setHasMore] = useState(false), [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false), [loadingMore, setLoadingMore] = useState(false), [total, setTotal] = useState(0);
   const [dark, setDark] = useState(false), [listError, setListError] = useState(""), [loadingList, setLoadingList] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -42,11 +71,21 @@ export default function Dashboard() {
     if (query.trim()) params.set("q", query.trim()); if (platform !== "all") params.set("platform", platform); if (status !== "all") params.set("status", status); if (date !== "all") params.set("date", date); if (selectedCategory !== "all") params.set("category", selectedCategory); if (selectedReason !== "all") params.set("reason", selectedReason);
     if (tab === "forgotten") params.set("forgotten", "1");
     setLoadingList(true);
+    // The saved-items list is the only call that can fail the page; stats and
+    // taxonomy degrade to stale values so heavy data never blanks the screen.
     try {
-      const [list, dashboard, cats, why] = await Promise.all([api(`/api/saved-items?${params}`), api("/api/dashboard"), api("/api/taxonomy/categories"), api("/api/taxonomy/reasons")]);
+      const [list, dashboard, cats, why] = await Promise.all([
+        api(`/api/saved-items?${params}`),
+        api("/api/dashboard").catch(() => null),
+        api("/api/taxonomy/categories").catch(() => null),
+        api("/api/taxonomy/reasons").catch(() => null),
+      ]);
       if (seq !== requestSeq.current) return; // A newer request finished after this one; drop the stale snapshot.
       setListError("");
-      setItems(list.body.items || []); setHasMore((list.body.page || 1) < (list.body.pages || 1)); setReminders(dashboard.body.items?.reminders || []); setActivity(dashboard.body.activity || []); setStats(dashboard.body.stats || { total: 0, unread: 0, completed: 0, forgotten: 0 }); setCategories(cats.body.items || []); setReasons(why.body.items || []);
+      if (dashboard) { setReminders(dashboard.body.items?.reminders || []); setActivity(dashboard.body.activity || []); setStats(dashboard.body.stats || { total: 0, unread: 0, completed: 0, forgotten: 0 }); }
+      if (cats) setCategories(cats.body.items || []);
+      if (why) setReasons(why.body.items || []);
+      setItems(list.body.items || []); setHasMore((list.body.page || 1) < (list.body.pages || 1)); setTotal(list.body.total || 0);
     } catch (error) {
       if (seq !== requestSeq.current) return;
       const message = (error as Error).message || "";
@@ -74,7 +113,7 @@ export default function Dashboard() {
     try { const { body } = await api(`/api/auth/${mode === "register" ? "register" : "login"}`, { method: "POST", body: JSON.stringify({ name, email, password }) }); setUser(body.user); toast.success(mode === "register" ? `Welcome to Memora, ${body.user.name.split(" ")[0]}!` : `Welcome back, ${body.user.name.split(" ")[0]}!`); }
     catch (error) { setAuthError((error as Error).message); } finally { setBusy(false); }
   }
-  async function logout() { await api("/api/auth/logout", { method: "POST" }); setUser(null); setItems([]); toast("Signed out. See you soon."); }
+  async function logout() { await api("/api/auth/logout", { method: "POST" }); setUser(null); setItems([]); setTotal(0); toast("Signed out. See you soon."); }
   async function save(event: React.FormEvent) {
     event.preventDefault(); if (busy) return; setBusy(true); setFormError("");
     try {
@@ -116,7 +155,7 @@ export default function Dashboard() {
       if (seq !== requestSeq.current) return; // Filters changed mid-load; discard to avoid duplicates.
       const seen = new Set(items.map((existing) => existing.id));
       setItems((previous) => [...previous, ...(body.items || []).filter((incoming: Item) => !seen.has(incoming.id))]);
-      setHasMore(body.page < body.pages);
+      setHasMore(body.page < body.pages); setTotal(body.total || 0);
     } catch (error) { toast.error((error as Error).message); } finally { setLoadingMore(false); }
   }
   async function addCategory(event: React.FormEvent) { event.preventDefault(); if (!newCategory.trim()) return; try { await api("/api/taxonomy/categories", { method: "POST", body: JSON.stringify({ name: newCategory }) }); setNewCategory(""); toast.success("Category added"); await refresh(); } catch (error) { toast.error((error as Error).message); } }
@@ -157,8 +196,8 @@ export default function Dashboard() {
           {listError && <div role="alert" className="mt-4 flex justify-between rounded-xl border border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-3 text-sm text-[var(--danger)]">{listError}<button onClick={() => { setListError(""); refresh(); }} aria-label="Dismiss and retry">Retry ×</button></div>}
           {tab !== "settings" && reminders.length > 0 && <section className="mt-5 rounded-2xl border border-[var(--amber-ink)]/30 bg-[var(--amber-soft)] p-4"><p className="text-xs font-semibold uppercase tracking-wide text-[var(--amber-ink)]">⏰ Due for a revisit</p><div className="mt-2 space-y-2">{reminders.map((item) => <div key={item.id} className="flex items-center gap-3 text-sm"><span className="min-w-0 flex-1 truncate">{item.title}</span><span className="text-xs text-[var(--ink-faint)]">{new Date(item.reminderAt!).toLocaleDateString()}</span><Link href={`/items/${item.id}`} className="text-xs font-medium text-[var(--accent-ink)]">Open</Link><button onClick={() => changeItem(item, { reminderAt: null })} className="text-xs text-[var(--ink-faint)] hover:text-[var(--ink)]" aria-label="Dismiss reminder">Done</button></div>)}</div></section>}
           <div className="mt-8 flex items-end justify-between"><div><p className="text-[11px] font-semibold uppercase tracking-[.14em] text-[var(--ink-faint)]">{tab === "forgotten" ? "A gentle nudge" : tab === "timeline" ? "As it happened" : "Collected over time"}</p><h2 className="mt-1 text-xl font-semibold tracking-tight">{tab === "forgotten" ? "Still worth remembering" : tab === "timeline" ? "Your recent timeline" : "Recently saved"}</h2></div>{tab === "memory" && <button onClick={() => setTab("timeline")} className="hidden text-sm text-[var(--accent-ink)] hover:underline sm:block">View timeline →</button>}</div>
-          {loadingList && visibleItems.length === 0 ? <div className="mt-5 grid gap-3 lg:grid-cols-2">{[0, 1, 2, 3].map((index) => <div key={index} className="card p-4"><div className="flex gap-4"><div className="skeleton h-[58px] w-[68px]" /><div className="flex-1 space-y-2"><div className="skeleton h-3 w-1/3" /><div className="skeleton h-4 w-3/4" /><div className="skeleton h-3 w-1/2" /></div></div><div className="mt-3 flex gap-2"><div className="skeleton h-5 w-20 rounded-full" /><div className="skeleton h-5 w-16 rounded-full" /></div></div>)}</div> : visibleItems.length === 0 ? <div className="mt-5 rounded-2xl border border-dashed border-[var(--border-strong)] bg-[var(--card)]/60 px-6 py-14 text-center anim-fade-up"><div className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-[var(--accent-soft)] text-xl text-[var(--accent-ink)]">⌁</div><h3 className="mt-4 font-semibold">{query ? (urlInSearch ? "Save this link?" : "Nothing found") : tab === "forgotten" ? "Nothing needs a nudge just yet" : "Your memory is ready"}</h3><p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-[var(--ink-soft)]">{query ? (urlInSearch ? "Looks like a link, not a search. Add it to your memory?" : "Try another keyword or remove a filter.") : tab === "forgotten" ? "Saves you haven’t revisited for a while will appear here." : "Save a link you want to come back to, and add a note to remember why."}</p>{urlInSearch && <button onClick={() => { setUrl(query.trim()); setQuery(""); setModal(true); }} className="primary mt-5">＋ Save this link</button>}{!query && tab !== "forgotten" && <button onClick={() => setModal(true)} className="secondary mt-5">Save something</button>}</div> : tab === "timeline" ? <Timeline items={visibleItems} changeItem={changeItem} /> : <div className="mt-5 grid gap-3 lg:grid-cols-2">{visibleItems.map((item) => <MemoryCard key={item.id} item={item} changeItem={changeItem} removeItem={removeItem} onTagClick={(tag) => { setQuery(tag); setTab("memory"); }} />)}</div>}
-          {hasMore && <div className="mt-6 text-center"><button disabled={loadingMore} onClick={loadMore} className="secondary">{loadingMore ? "Loading…" : "Load more"}</button></div>}
+          {loadingList && visibleItems.length === 0 ? <div className="mt-5 grid gap-3 lg:grid-cols-2">{[0, 1, 2, 3].map((index) => <div key={index} className="card p-4"><div className="flex gap-4"><div className="skeleton h-[58px] w-[68px]" /><div className="flex-1 space-y-2"><div className="skeleton h-3 w-1/3" /><div className="skeleton h-4 w-3/4" /><div className="skeleton h-3 w-1/2" /></div></div><div className="mt-3 flex gap-2"><div className="skeleton h-5 w-20 rounded-full" /><div className="skeleton h-5 w-16 rounded-full" /></div></div>)}</div> : visibleItems.length === 0 ? <div className="mt-5 rounded-2xl border border-dashed border-[var(--border-strong)] bg-[var(--card)]/60 px-6 py-14 text-center anim-fade-up"><div className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-[var(--accent-soft)] text-xl text-[var(--accent-ink)]">⌁</div><h3 className="mt-4 font-semibold">{query ? (urlInSearch ? "Save this link?" : "Nothing found") : tab === "forgotten" ? "Nothing needs a nudge just yet" : "Your memory is ready"}</h3><p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-[var(--ink-soft)]">{query ? (urlInSearch ? "Looks like a link, not a search. Add it to your memory?" : "Try another keyword or remove a filter.") : tab === "forgotten" ? "Saves you haven’t revisited for a while will appear here." : "Save a link you want to come back to, and add a note to remember why."}</p>{urlInSearch && <button onClick={() => { setUrl(query.trim()); setQuery(""); setModal(true); }} className="primary mt-5">＋ Save this link</button>}{!query && tab !== "forgotten" && <button onClick={() => setModal(true)} className="secondary mt-5">Save something</button>}</div> : tab === "timeline" ? <Timeline items={visibleItems} changeItem={changeItem} /> : <div className="mt-5 space-y-8">{dateGroups.map((group) => { const rows = visibleItems.filter((item) => dateGroup(item.savedAt) === group); if (!rows.length) return null; return <section key={group} className="anim-fade-up"><h3 className="text-xs font-semibold uppercase tracking-[.13em] text-[var(--ink-faint)]">{group}</h3><div className="mt-3 grid gap-3 lg:grid-cols-2">{rows.map((item) => <MemoryCard key={item.id} item={item} changeItem={changeItem} removeItem={removeItem} onTagClick={(tag) => { setQuery(tag); setTab("memory"); }} />)}</div></section>; })}</div>}
+          {hasMore && <div className="mt-6 text-center"><button disabled={loadingMore} onClick={loadMore} className="secondary">{loadingMore ? "Loading…" : `Load more — ${items.length} of ${total || items.length} shown`}</button></div>}
           {tab === "forgotten" && stats.forgotten > 4 && <p className="mt-4 text-center text-sm text-[var(--ink-faint)]">Showing a few older saves. Use search and filters to find others.</p>}
           {tab !== "settings" && activity.length > 0 && <details className="panel mt-8"><summary className="cursor-pointer text-sm font-semibold">Recent activity</summary><div className="mt-3 divide-y divide-[var(--border)]">{activity.map((entry, index) => <Link key={`${entry.itemId}-${entry.createdAt}-${index}`} href={`/items/${entry.itemId}`} className="flex items-center gap-3 py-3 text-sm"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-ink)]">{entry.type === "saved" ? "+" : entry.type === "completed" ? "✓" : "↻"}</span><span className="min-w-0 flex-1 truncate"><span className="font-medium">{entry.type.replaceAll("_", " ")}</span><span className="text-[var(--ink-faint)]"> · {entry.title}</span></span><time className="shrink-0 text-xs text-[var(--ink-faint)]">{new Date(entry.createdAt).toLocaleDateString()}</time></Link>)}</div></details>}
         </>}
