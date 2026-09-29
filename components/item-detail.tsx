@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
+import { confirmDialog } from "@/components/confirm-dialog";
 import { useEffect, useState } from "react";
 
 type Item = {
@@ -68,10 +69,13 @@ export default function ItemDetail({ id }: { id: string }) {
   }
 
   async function remove() {
-    if (!confirm("Delete this memory? This can’t be undone.")) return;
-    const response = await fetch(`/api/saved-items/${id}`, { method: "DELETE" });
-    if (response.ok) { toast.success("Memory deleted"); router.push("/"); }
-    else toast.error("Could not delete this memory. Try again.");
+    if (!(await confirmDialog({ title: "Delete this memory?", message: "This can’t be undone.", confirmLabel: "Delete", tone: "danger" }))) return;
+    try {
+      const response = await fetch(`/api/saved-items/${id}`, { method: "DELETE" });
+      if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "Could not delete this memory. Try again."); }
+      toast.success("Memory deleted");
+      router.push("/");
+    } catch (cause) { toast.error((cause as Error).message); }
   }
 
   if (error) return <main className="grid min-h-screen place-items-center bg-[var(--bg)] p-5"><div className="panel max-w-md text-center"><h1 className="text-xl font-semibold">Memory unavailable</h1><p className="mt-2 text-sm text-[var(--ink-soft)]">{error}</p><Link href="/" className="mt-5 inline-block text-sm font-medium text-[var(--accent-ink)] hover:underline">← Back to your memory</Link></div></main>;
