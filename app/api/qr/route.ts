@@ -16,11 +16,11 @@ export async function GET(request: Request) {
       const dataUrl = await QRCode.toDataURL(data, { errorCorrectionLevel: "M", margin: 2, width: 720, color: { dark: "#1f241e", light: "#ffffff" } });
       const png = Buffer.from(dataUrl.replace(/^data:image\/png;base64,/, ""), "base64");
       return new Response(new Uint8Array(png), {
-        headers: { "Content-Type": "image/png", "Content-Disposition": 'attachment; filename="memora-qr.png"', "Cache-Control": "public, max-age=86400" },
+        headers: { "Content-Type": "image/png", "Content-Disposition": 'attachment; filename="memora-qr.png"', "Cache-Control": "public, max-age=86400", "Access-Control-Allow-Origin": "*" },
       });
     }
     const svg = await QRCode.toString(data, { type: "svg", errorCorrectionLevel: "M", margin: 1, color: { dark: "#1f241e", light: "#ffffff" } });
-    return new Response(svg, { headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" } });
+    return new Response(svg, { headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400", "Access-Control-Allow-Origin": "*" } });
   } catch {
     return new Response("Couldn't render that QR code.", { status: 400 });
   }
