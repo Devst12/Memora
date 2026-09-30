@@ -20,6 +20,8 @@ let lastSavedFeedId = ""; // Skip re-saves when the feed re-renders the same vid
 let lastSaveWasDuplicate = false; // Re-click after a duplicate should show the duplicate, not the feed refusal.
 let longPressTimer = null; // 2s hold opens the composer; cancelled by release, drag, or cancel events.
 let suppressClick = false; // The click that ends a long-press must not also save the page.
+let sharePollTimer = null; // Upload-status polling for the share card.
+let sharePollId = ""; // Note id the current poll belongs to.
 
 function ensureShadow() {
   const existing = document.getElementById(HOST_ID);
@@ -75,19 +77,31 @@ function ensureShadow() {
     .m-c-post{width:100%;background:#4f7d58;color:#fff;border:none;border-radius:11px;padding:11px;font:inherit;font-weight:650;font-size:14px;cursor:pointer}
     .m-c-post:hover{background:#45704e}
     .m-c-post:disabled{opacity:.6;cursor:wait}
-    .m-share{position:fixed;right:${EDGE_MARGIN}px;bottom:20px;width:264px;background:#20251f;color:#f3f4f1;border-radius:18px;padding:16px;
-      box-shadow:0 24px 70px -20px rgba(0,0,0,.65);font:13px/1.5 system-ui,sans-serif;z-index:3;text-align:center;
+    .m-share{position:fixed;right:${EDGE_MARGIN}px;bottom:20px;width:min(330px,calc(100vw - 32px));background:#20251f;color:#f3f4f1;border-radius:18px;padding:16px;
+      box-shadow:0 24px 70px -20px rgba(0,0,0,.65);font:13px/1.5 system-ui,sans-serif;z-index:3;
       animation:m-pop .18s cubic-bezier(.2,.9,.3,1.2) both}
     .m-share-title{font-weight:650;margin-bottom:10px}
-    .m-share-qr{width:150px;height:150px;background:#fff;border-radius:12px;padding:6px;box-sizing:border-box;display:block;margin:0 auto}
-    .m-share-link{display:block;margin:8px 0 2px;color:#a9d0a4;font-size:11.5px;word-break:break-all;text-decoration:none}
-    .m-share-link:hover{text-decoration:underline}
-    .m-share-row{display:flex;gap:6px;margin-top:8px}
-    .m-share-btn{flex:1;background:#2c332a;border:1px solid #39423a;color:#dce4d8;border-radius:9px;padding:7px 4px;font:inherit;font-size:12px;cursor:pointer}
+    .m-share-tabs{display:flex;gap:6px;margin-bottom:10px}
+    .m-share-tabs .m-share-btn{flex:1}
+    .m-share-btn{background:#2c332a;border:1px solid #39423a;color:#dce4d8;border-radius:9px;padding:7px 4px;font:inherit;font-size:12px;cursor:pointer}
     .m-share-btn:hover{border-color:#7fa074;color:#fff}
-    .m-share-close{width:100%;margin-top:8px}
-    .m-share-vis{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;font-size:12px;color:#a9b3a5;text-align:left}
-    .m-share-hint{margin-top:8px;font-size:11.5px;color:#8a938a;text-align:left}
+    .m-share-panel{border:1px solid #39423a;border-radius:12px;padding:12px;margin-bottom:10px}
+    .m-share-panel[hidden]{display:none}
+    .m-share-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+    .m-share-net{display:flex;flex-direction:column;align-items:center;gap:3px;background:#232a21;border:1px solid #39423a;border-radius:10px;
+      padding:8px 4px;font:inherit;font-size:11.5px;color:#dce4d8;cursor:pointer}
+    .m-share-net:hover{border-color:#7fa074;color:#fff}
+    .m-share-net b{font-size:16px;line-height:1}
+    .m-share-net small{font-size:10.5px;color:#8a938a}
+    .m-share-net:disabled{opacity:.45;cursor:wait}
+    .m-share-qr{width:168px;height:168px;background:#fff;border-radius:12px;padding:6px;box-sizing:border-box;display:block;margin:0 auto}
+    .m-share-link{display:block;margin:8px auto 2px;color:#a9d0a4;font-size:11.5px;word-break:break-all;text-align:center;text-decoration:none;max-width:100%}
+    .m-share-link:hover{text-decoration:underline}
+    .m-share-actions{display:flex;gap:6px;margin-top:8px}
+    .m-share-actions .m-share-btn{flex:1}
+    .m-share-close{flex:none;width:42px;margin-left:0}
+    .m-share-vis{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;font-size:12px;color:#a9b3a5}
+    .m-share-hint{margin-top:8px;font-size:11.5px;color:#8a938a}
   `;
   shadowRoot.appendChild(style);
   return { host, root: shadowRoot };
@@ -141,6 +155,18 @@ function setFab(state) {
 
 const COMPRESS_TARGET_BYTES = 900 * 1024; // Per-image compression target (~<1MB).
 
+// One-tap share targets for the networks people actually post to. `url` builds
+// the network's prefilled share endpoint; WhatsApp uses the plain text form.
+const SHARE_TARGETS = [
+  { name: "WhatsApp", icon: "✆", url: (link) => `https://wa.me/?text=${encodeURIComponent(link)}` },
+  { name: "Telegram", icon: "➤", url: (link) => `https://t.me/share/url?url=${encodeURIComponent(link)}` },
+  { name: "X", icon: "𝕏", url: (link, text) => `https://twitter.com/intent/tweet?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}` },
+  { name: "Facebook", icon: "f", url: (link) => `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(link)}` },
+  { name: "Reddit", icon: "alien", url: (link, text) => `https://www.reddit.com/submit?url=${encodeURIComponent(link)}&title=${encodeURIComponent(text)}` },
+  { name: "LinkedIn", icon: "in", url: (link) => `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(link)}` },
+  { name: "Email", icon: "@", url: (link, text) => `mailto:?subject=${encodeURIComponent(text)}&body=${encodeURIComponent(link)}` },
+];
+
 let composerState = null; // { files: [{file, name, kind, size, status}], visibility: "public" }
 
 // Offscreen-canvas re-encode: WebP first (smallest), quality and then size
@@ -182,6 +208,7 @@ function composerAddFiles(fileList) {
     composerState.files.push({ file, name: file.name, kind: isImage ? "image" : "file", size: file.size, status: isImage ? "pending" : "ready" });
   }
   composerRenderFiles();
+  composerSyncPost();
 }
 
 function composerRenderFiles() {
@@ -202,10 +229,18 @@ function composerRenderFiles() {
     const remove = document.createElement("button");
     remove.type = "button"; remove.className = "m-c-file-x"; remove.textContent = "×";
     remove.setAttribute("aria-label", `Remove ${entry.name}`);
-    remove.addEventListener("click", () => { composerState.files.splice(index, 1); composerRenderFiles(); });
+    remove.addEventListener("click", () => { composerState.files.splice(index, 1); composerRenderFiles(); composerSyncPost(); });
     row.append(label, state, remove);
     list.appendChild(row);
   });
+}
+
+// Post unlocks as soon as the note has any text or any attachment.
+function composerSyncPost() {
+  const post = shadowRoot?.getElementById("m-c-post");
+  if (!post || !composerState) return;
+  const text = shadowRoot.getElementById("m-c-text").value.trim();
+  post.disabled = !text && !composerState.files.length;
 }
 
 function composerNote(message, bad) {
@@ -227,18 +262,24 @@ function composerBusy(busy) {
   if (close) close.disabled = busy;
 }
 
-// Fire the POST as soon as the note is stored — the server answers 202 while
-// image uploads continue in the background, so this stays instant even with
-// big files. Returns the share URL for the card below.
+// Stop the share card's upload polling when the card goes away.
+function stopSharePoll() {
+  if (sharePollTimer) { clearInterval(sharePollTimer); sharePollTimer = null; }
+  sharePollId = "";
+}
+
+// Post immediately: the note (text, title, visibility) is stored and the server
+// answers with the real share link in one round trip while attachments upload
+// afterwards on the server.
 async function composerPost() {
   if (!composerState) return;
   const text = shadowRoot.getElementById("m-c-text").value.trim();
   const title = shadowRoot.getElementById("m-c-title").value.trim();
   if (!text && !composerState.files.length) { composerNote("Add some text or a file first."); return; }
   const { apiUrl, token } = await chrome.storage.local.get(["apiUrl", "token"]);
-  if (!apiUrl) { composerNote("Open the Memora popup and connect first.", true); return; }
+  if (!apiUrl || !token) { composerNote("Open the Memora popup and connect first.", true); return; }
   composerBusy(true);
-  composerNote("Preparing attachments…");
+  composerNote(composerState.files.length ? "Compressing & posting…" : "Posting…");
   const form = new FormData();
   form.append("text", text);
   form.append("title", title);
@@ -247,110 +288,140 @@ async function composerPost() {
   form.append("sourceTitle", (currentPageTitle() || document.title || "").slice(0, 300));
 
   try {
-    let uploadingName = "";
-    let pending = 0;
     for (const entry of composerState.files) {
       if (entry.kind === "image") {
         entry.status = "compressing"; composerRenderFiles();
         const compressed = await compressImage(entry.file);
         const blob = compressed?.blob || entry.file;
-        if (compressed) { entry.size = blob.size; entry.name = compressed.name; }
-        entry.status = "uploading"; composerRenderFiles();
-        pending += 1;
-        if (!uploadingName) uploadingName = entry.name;
-        form.append("files", new File([blob], entry.name, { type: blob.type || "image/webp" }));
+        const name = compressed?.name || entry.name;
+        entry.status = "ready"; composerRenderFiles();
+        form.append("files", new File([blob], name, { type: blob.type || "image/webp" }));
       } else {
         if (entry.file.size > 8 * 1024 * 1024) throw new Error(`"${entry.name}" is over the 8MB limit for documents.`);
-        form.append("files", entry.file);
+        form.append("files", entry.file, entry.name);
       }
     }
-    composerNote(pending ? `Uploading ${pending} image${pending > 1 ? "s" : ""}…` : "Posting…");
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000); // The 202 arrives fast; uploads continue server-side.
-    let response, body = {};
-    try {
-      // Token auth (no cookies): the app's CORS policy answers simple token
-      // requests from any origin, while credentialed ones can never succeed.
-      response = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/notes`, {
-        method: "POST",
-        body: form,
-        signal: controller.signal,
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-      });
-      try { body = await response.json(); } catch { /* The server's 202 hangup lands here — still a success. */ }
-    } catch (error) {
-      if (error?.name === "AbortError") { composerBusy(false); composerNote("Large upload still running — it will finish in the background. Check Memora in a moment.", true); return; }
-      // "Failed to fetch" means the app never answered: offline, or the server
-      // hasn't been redeployed since the composer was added (it 404s without
-      // CORS headers, which the browser reports as exactly this error).
-      composerBusy(false);
-      composerNote(`Can't reach ${apiUrl}. Check your connection — and if Memora's server hasn't been redeployed since the composer shipped, update it first.`, true);
-      return;
-    } finally { clearTimeout(timeout); }
-    if (response.status === 202 || (response.ok && body.async)) body.ok = true;
+    // Token auth, no cookies: the app's CORS policy answers simple token
+    // requests from any origin, while credentialed ones can never succeed.
+    const response = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/notes`, {
+      method: "POST",
+      body: form,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    let body = {};
+    try { body = await response.json(); } catch { /* Non-JSON error bodies fall through. */ }
     if (!response.ok && response.status !== 202) throw new Error(body.error || `Couldn't post (HTTP ${response.status}).`);
     closeComposer();
     setFab("ok");
-    showToast("Note posted ✓", uploadingName ? `Uploading "${uploadingName}" finishes in the background.` : "Use the link or QR code to share it.", "");
-    showShareCard({ shareUrl: body.shareUrl, slug: body.slug, id: body.id }, uploadingName);
+    showToast("Note posted ✓", "Share it with the link, QR code, or share buttons.", "");
+    showShareCard({ shareUrl: body.shareUrl, slug: body.slug, id: body.id });
     setTimeout(() => setFab("idle"), 2400);
   } catch (error) {
     composerBusy(false);
-    composerNote(error?.message || "Couldn't post the note.", true);
+    // "Failed to fetch" means the app never answered: offline, or the server
+    // hasn't been redeployed since the composer shipped (it 404s without CORS
+    // headers, which the browser reports as exactly this error).
+    composerNote(/failed to fetch/i.test(String(error?.message))
+      ? `Can't reach ${apiUrl}. Check your connection — and redeploy the Memora server if it hasn't been updated since the composer shipped.`
+      : error?.message || "Couldn't post the note.", true);
   }
 }
 
-// Bottom card with the QR code, the link, and quick actions — shown right
-// after a note is posted so sharing is one glance away.
-function showShareCard({ shareUrl, slug, id }, uploadingName) {
+// Bottom card shown right after a note is posted: Share (platform targets),
+// QR (a real downloadable image), and the visibility switch. With attachments,
+// it polls the note and reports upload progress.
+function showShareCard({ shareUrl, slug, id, title: noteTitle }) {
   const { root } = ensureShadow();
   root.getElementById("m-share")?.remove();
+  stopSharePoll();
   chrome.storage.local.get(["apiUrl", "token"]).then(({ apiUrl, token }) => {
     const origin = (apiUrl || "").replace(/\/+$/, "");
     const url = `${origin}${shareUrl || `/s/${slug || id}`}`;
     const card = document.createElement("div");
     card.className = "m-share";
     card.id = "m-share";
+
     const title = document.createElement("div");
     title.className = "m-share-title";
     title.textContent = "Note posted — share it";
-    const qr = document.createElement("img");
-    qr.className = "m-share-qr";
-    qr.alt = "QR code";
-    qr.src = `${origin}/api/qr?data=${encodeURIComponent(url)}`;
-    const link = document.createElement("a");
-    link.className = "m-share-link";
-    link.href = url; link.target = "_blank"; link.rel = "noopener";
-    link.textContent = url;
+
     const mkButton = (label, onClick) => {
       const button = document.createElement("button");
       button.type = "button"; button.className = "m-share-btn"; button.textContent = label;
       button.addEventListener("click", onClick);
       return button;
     };
-    const row = document.createElement("div");
-    row.className = "m-share-row";
-    row.append(
-      mkButton("Copy link", async () => { try { await navigator.clipboard.writeText(url); } catch { /* Clipboard can be blocked; the link is visible above. */ } }),
-      mkButton("Open", () => window.open(url, "_blank", "noopener")),
-      mkButton("Save QR", async () => {
-        try {
-          const response = await fetch(`${origin}/api/qr?data=${encodeURIComponent(url)}&png=1`);
-          const blob = await response.blob();
-          const objectUrl = URL.createObjectURL(blob);
-          const anchor = document.createElement("a");
-          anchor.href = objectUrl; anchor.download = "memora-qr.png"; anchor.click();
-          setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
-        } catch { window.open(`${origin}/api/qr?data=${encodeURIComponent(url)}&png=1`, "_blank", "noopener"); }
+
+    // Two tabs: where to share it, and the scannable code.
+    const tabs = document.createElement("div");
+    tabs.className = "m-share-tabs";
+    const sharePanel = document.createElement("div");
+    sharePanel.className = "m-share-panel";
+    const qrPanel = document.createElement("div");
+    qrPanel.className = "m-share-panel";
+    qrPanel.hidden = true;
+    const shareTab = mkButton("Share", () => { sharePanel.hidden = false; qrPanel.hidden = true; shareTab.style.borderColor = "#7fa074"; qrTab.style.borderColor = ""; });
+    const qrTab = mkButton("QR code", () => { sharePanel.hidden = true; qrPanel.hidden = false; qrTab.style.borderColor = "#7fa074"; shareTab.style.borderColor = ""; });
+    shareTab.style.borderColor = "#7fa074";
+    tabs.append(shareTab, qrTab);
+
+    // One-tap targets for the networks people actually share to.
+    const grid = document.createElement("div");
+    grid.className = "m-share-grid";
+    for (const net of SHARE_TARGETS) {
+      const button = document.createElement("button");
+      button.type = "button"; button.className = "m-share-net";
+      const icon = document.createElement("b"); icon.textContent = net.icon;
+      const name = document.createElement("small"); name.textContent = net.name;
+      button.append(icon, name);
+      button.addEventListener("click", () => window.open(net.url(url, encodeURIComponent(noteTitle || "Memora note")), "_blank", "noopener"));
+      grid.appendChild(button);
+    }
+    const link = document.createElement("a");
+    link.className = "m-share-link"; link.href = url; link.target = "_blank"; link.rel = "noopener";
+    link.textContent = url;
+    const copyRow = document.createElement("div");
+    copyRow.className = "m-share-actions";
+    copyRow.append(
+      mkButton("Copy link", async () => { try { await navigator.clipboard.writeText(url); } catch { /* The link is visible above. */ } }),
+      mkButton("More…", async () => {
+        if (navigator.share) { try { await navigator.share({ title: noteTitle || "Memora note", url }); return; } catch { /* Dismissed. */ } }
+        try { await navigator.clipboard.writeText(url); } catch { /* The link is visible above. */ }
       }),
     );
+    sharePanel.append(grid, link, copyRow);
+
+    const qr = document.createElement("img");
+    qr.className = "m-share-qr"; qr.alt = "QR code";
+    qr.src = `${origin}/api/qr?data=${encodeURIComponent(url)}`;
+    const qrLink = document.createElement("a");
+    qrLink.className = "m-share-link"; qrLink.href = url; qrLink.target = "_blank"; qrLink.rel = "noopener";
+    qrLink.textContent = url;
+    const qrActions = document.createElement("div");
+    qrActions.className = "m-share-actions";
+    // A real PNG download: fetch the bytes and hand them to the browser's
+    // saver, falling back to a direct tab if the fetch is blocked.
+    const qrDownload = mkButton("Download QR", async () => {
+      try {
+        const response = await fetch(`${origin}/api/qr?data=${encodeURIComponent(url)}&png=1`);
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = objectUrl; anchor.download = "memora-qr.png"; anchor.click();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
+      } catch { window.open(`${origin}/api/qr?data=${encodeURIComponent(url)}&png=1`, "_blank", "noopener"); }
+    });
+    const qrCopy = mkButton("Copy link", async () => { try { await navigator.clipboard.writeText(url); } catch { /* The link is visible above. */ } });
+    qrActions.append(qrDownload, qrCopy);
+    qrPanel.append(qr, qrLink, qrActions);
+
     const visRow = document.createElement("div");
     visRow.className = "m-share-vis";
     const visLabel = document.createElement("span");
     visLabel.textContent = "🌍 Public — anyone with the link";
     const visToggle = mkButton("Make private", async () => {
-      if (!id) { visLabel.textContent = "Sign in to Memora to change visibility."; return; }
       const next = visToggle.dataset.vis === "public" ? "private" : "public";
+      visToggle.disabled = true;
       try {
         const response = await fetch(`${origin}/api/notes/${id}`, {
           method: "PATCH",
@@ -362,16 +433,42 @@ function showShareCard({ shareUrl, slug, id }, uploadingName) {
         visToggle.textContent = next === "public" ? "Make private" : "Make public";
         visLabel.textContent = next === "public" ? "🌍 Public — anyone with the link" : "🔒 Private — only you";
       } catch { visLabel.textContent = "Couldn't change visibility — open the Memora popup and reconnect."; }
+      finally { visToggle.disabled = false; }
     });
     visToggle.dataset.vis = "public";
-    if (!id) visToggle.disabled = true;
     visRow.append(visLabel, visToggle);
+
     const hint = document.createElement("div");
     hint.className = "m-share-hint";
-    hint.textContent = uploadingName ? `"${uploadingName}" finishes uploading in the background.` : "Anyone with this link or QR can view and download the note.";
-    const close = mkButton("Close", () => card.remove());
+    hint.textContent = "Attachments upload in the background — this card updates as they finish.";
+
+    if (id) {
+      sharePollId = id;
+      sharePollTimer = setInterval(async () => {
+        if (!sharePollId || !root.getElementById("m-share")) { stopSharePoll(); return; }
+        try {
+          const response = await fetch(`${origin}/api/notes/${id}`, { headers: { Authorization: `Bearer ${token || ""}` } });
+          if (!response.ok) return;
+          const payload = await response.json();
+          const files = payload.note?.files || [];
+          const uploading = files.filter((f) => f.status === "uploading").length;
+          const failed = files.filter((f) => f.status === "error").length;
+          if (!uploading) {
+            stopSharePoll();
+            hint.textContent = failed ? `${failed} attachment${failed > 1 ? "s" : ""} failed to upload — retry from your Memora notes.` : files.length ? "All attachments uploaded ✓" : "Anyone with this link or QR can view the note.";
+          } else hint.textContent = `Uploading attachments… ${files.length - uploading}/${files.length} done`;
+        } catch { /* Transient poll errors just wait for the next tick. */ }
+      }, 2500);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "m-share-actions";
+    const openButton = mkButton("Open note", () => window.open(url, "_blank", "noopener"));
+    const close = mkButton("✕", () => { stopSharePoll(); card.remove(); });
     close.classList.add("m-share-close");
-    card.append(title, qr, link, row, visRow, hint, close);
+    actions.append(openButton, close);
+
+    card.append(title, tabs, sharePanel, qrPanel, visRow, hint, actions);
     root.appendChild(card);
   });
 }
@@ -442,12 +539,25 @@ function openComposer() {
   post.className = "m-c-post";
   post.id = "m-c-post";
   post.textContent = "Post";
+  post.disabled = true; // Enabled as soon as there's anything to post.
   post.addEventListener("click", composerPost);
 
+  // Post unlocks with any content; Escape closes; clicking outside closes too.
+  textarea.addEventListener("input", composerSyncPost);
   panel.addEventListener("keydown", (event) => { if (event.key === "Escape") closeComposer(); });
   panel.append(header, title, textarea, fileRow, fileInput, files, note, post);
   root.appendChild(panel);
-  setTimeout(() => textarea.focus(), 30);
+  setTimeout(() => {
+    const onOutsidePointer = (event) => {
+      const panelEl = root.getElementById("m-composer");
+      if (!panelEl) { document.removeEventListener("pointerdown", onOutsidePointer, true); return; }
+      if (event.composedPath().includes(panelEl)) return;
+      closeComposer();
+      document.removeEventListener("pointerdown", onOutsidePointer, true);
+    };
+    document.addEventListener("pointerdown", onOutsidePointer, true);
+    textarea.focus();
+  }, 30);
 }
 
 function describe(result) {
