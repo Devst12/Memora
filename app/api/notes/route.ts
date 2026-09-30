@@ -1,37 +1,43 @@
 // Create a note from the extension composer (long-press on the floating button).
 // Auth: extension token (Bearer) or dashboard session — same rule as capture.
-// Storage: images go to imgbb (key stays server-side); every other allowed file
-// type (pdf/docs/text) is kept as base64 inside the note document, within the
-// 16MB MongoDB document budget — see lib/notes.ts for the exact caps.
+// Speed model: the note document (text, title, visibility, slug) is inserted
+// immediately with attachment placeholders, and the 202 response carries the
+// real id + slug. Attachments upload afterwards on the server; file entries
+// flip to ready as each finishes, and the CORS headers let the extension poll
+// until everything shows as uploaded.
 
 import { ObjectId } from "mongodb";
+import { after } from "next/server";
 import { rateLimited } from "@/lib/rate-limit";
 import { currentUser } from "@/lib/auth";
 import { database } from "@/lib/db";
 import { handleError, jsonError, safeText } from "@/lib/http";
 import { uploadToImgbb } from "@/lib/imgbb";
-import { MAX_FILES_B64_TOTAL, MAX_FILE_BYTES, MAX_NOTE_FILES, MAX_TEXT_LENGTH, MAX_TITLE_LENGTH, isAllowedDoc, looksLikeImage, makeFileId, newShareSlug, notesCollection, type NoteDoc } from "@/lib/notes";
+import { MAX_FILES_B64_TOTAL, MAX_FILE_BYTES, MAX_NOTE_FILES, MAX_TEXT_LENGTH, MAX_TITLE_LENGTH, isAllowedDoc, looksLikeImage, makeFileId, newShareSlug, notesCollection, serializeNote, type NoteDoc, type StoredFile } from "@/lib/notes";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-// Early answer to the service-worker preflight (perceived speed beat):
-// the token is valid, the save is accepted, uploads finish in the background.
-function preflight() {
-  return new Response(JSON.stringify({ ok: true, async: true, message: "Uploading attachments…" }), {
-    status: 202,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-  });
-}
+const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" };
 
 export async function OPTIONS() {
-  return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" } });
+  return new Response(null, { status: 204, headers: CORS });
+}
+
+// Owner's note list for the dashboard's Notes tab — newest first, never
+// includes file bytes; each file carries its upload status.
+export async function GET(request: Request) {
+  try {
+    const user = await currentUser(request);
+    if (!user) return jsonError("Sign in required.", 401);
+    const params = new URL(request.url).searchParams;
+    const limit = Math.min(100, Math.max(1, Number(params.get("limit")) || 50));
+    const notes = await notesCollection(await database()).find({ userId: user._id }).sort({ createdAt: -1 }).limit(limit).toArray();
+    return Response.json({ notes: notes.map(serializeNote) });
+  } catch (error) { return handleError(error); }
 }
 
 export async function POST(request: Request) {
-  const controller = new AbortController();
-  // The SW hangs up right after reading the 202 — that's by design, not an error.
-  request.signal.addEventListener("abort", () => setTimeout(() => controller.abort(), 300));
   try {
     const user = await currentUser(request);
     if (!user) return jsonError("Extension token is invalid or revoked.", 401);
@@ -43,42 +49,22 @@ export async function POST(request: Request) {
     const visibility = form.get("visibility") === "private" ? "private" : "public";
     const sourceUrl = safeText(form.get("sourceUrl"), 1000);
     const sourceTitle = safeText(form.get("sourceTitle"), 300);
-    if (!text && !(form.get("files") instanceof File)) return jsonError("Add some text or a file to post.");
+    if (!text && !form.getAll("files").some((f) => f instanceof File)) return jsonError("Add some text or a file to post.");
 
+    // Up to 10 attachments; every non-image type must be on the allowlist.
     const rawFiles = form.getAll("files").filter((f): f is File => f instanceof File);
     if (rawFiles.length > MAX_NOTE_FILES) return jsonError(`Up to ${MAX_NOTE_FILES} files per note.`);
-    const files = [];
-    let b64Total = 0;
-    for (const file of rawFiles) {
-      const kind = looksLikeImage(file) ? "image" : "file";
-      if (kind === "image") {
-        // Preferred path: imgbb hosting. If the host rejects the upload (quota,
-        // blocked key, regional block, outage), keep working by storing the
-        // bytes in the document like any other file — composer images are
-        // compressed under ~1MB client-side, so this fits comfortably.
-        try {
-          const hosted = await uploadToImgbb(file);
-          files.push({ id: makeFileId(), name: safeText(file.name, 200) || "image", type: file.type || "image/webp", size: file.size, kind: "image" as const, url: hosted.url, thumbUrl: hosted.thumbUrl });
-        } catch {
-          if (file.size > MAX_FILE_BYTES) return jsonError(`"${file.name}" is too large to store (host upload also failed).`);
-          const buffer = Buffer.from(await file.arrayBuffer());
-          const data = buffer.toString("base64");
-          b64Total += data.length;
-          if (b64Total > MAX_FILES_B64_TOTAL) return jsonError("These files together are too large for one note.");
-          files.push({ id: makeFileId(), name: safeText(file.name, 200) || "image", type: file.type || "image/webp", size: buffer.length, kind: "image" as const, data });
-        }
-      } else {
-        if (!isAllowedDoc(file)) return jsonError(`"${file.name}" isn't a supported file type (pdf, docs, sheets, text).`);
-        if (file.size > MAX_FILE_BYTES) return jsonError(`"${file.name}" is too large. Files are capped at 8MB (images are compressed automatically).`);
-        const buffer = Buffer.from(await file.arrayBuffer());
-        const data = buffer.toString("base64");
-        b64Total += data.length;
-        if (b64Total > MAX_FILES_B64_TOTAL) return jsonError("These files together are too large for one note (about 8MB of documents max).");
-        files.push({ id: makeFileId(), name: safeText(file.name, 200) || "file", type: file.type || "application/octet-stream", size: buffer.length, kind: "file" as const, data });
-      }
-    }
-
     const now = new Date();
+    const files: StoredFile[] = rawFiles.map((file) => ({
+      id: makeFileId(),
+      name: safeText(file.name, 200) || (looksLikeImage(file) ? "image" : "file"),
+      type: file.type || (looksLikeImage(file) ? "image/webp" : "application/octet-stream"),
+      size: file.size,
+      kind: looksLikeImage(file) ? "image" as const : "file" as const,
+      status: "uploading" as const,
+    }));
+
+    // The note exists NOW with its permanent id + slug; attachments stream in after.
     const _id = new ObjectId();
     const note: NoteDoc = {
       _id,
@@ -86,10 +72,47 @@ export async function POST(request: Request) {
       sourceUrl, sourceTitle, createdAt: now, updatedAt: now,
     };
     await notesCollection(await database()).insertOne(note);
-    if (controller.signal.aborted) return preflight(); // Client hung up — finish storing anyway.
-    return Response.json({ ok: true, id: _id.toHexString(), slug: note.slug, title: note.title || (text ? `${text.slice(0, 60)}…` : "Note"), visibility, shareUrl: `/s/${note.slug}` }, { status: 201, headers: { "Access-Control-Allow-Origin": "*" } });
-  } catch (error) {
-    if (controller.signal.aborted) return preflight();
-    return handleError(error);
-  }
+
+    // Uploads happen after the response has already gone out. Each file updates
+    // itself in place: images land on imgbb (falling back to in-database bytes
+    // if the host refuses), documents store as base64 inside the document
+    // within the 16MB MongoDB budget — see lib/notes.ts for the exact caps.
+    if (files.length) {
+      after(async () => {
+        const coll = notesCollection(await database());
+        let b64Total = 0;
+        for (let index = 0; index < files.length; index += 1) {
+          const file = files[index];
+          const raw = rawFiles[index];
+          try {
+            if (file.kind === "image") {
+              try {
+                const hosted = await uploadToImgbb(raw);
+                const ready: StoredFile = { ...file, url: hosted.url, thumbUrl: hosted.thumbUrl, status: "ready" };
+                await coll.updateOne({ _id }, { $set: { [`files.${index}`]: ready, updatedAt: new Date() } });
+                continue;
+              } catch { /* Host unavailable — keep the image by storing it here. */ }
+              if (raw.size > MAX_FILE_BYTES) { await coll.updateOne({ _id }, { $set: { [`files.${index}.status`]: "error", updatedAt: new Date() } }); continue; }
+              const buffer = Buffer.from(await raw.arrayBuffer());
+              const data = buffer.toString("base64");
+              if (b64Total + data.length > MAX_FILES_B64_TOTAL) { await coll.updateOne({ _id }, { $set: { [`files.${index}.status`]: "error" }, $unset: { [`files.${index}.data`]: "" }, updatedAt: new Date() } as never); continue; }
+              b64Total += data.length;
+              await coll.updateOne({ _id }, { $set: { [`files.${index}`]: { ...file, data, size: buffer.length, status: "ready" }, updatedAt: new Date() } });
+            } else {
+              if (!isAllowedDoc(raw) || raw.size > MAX_FILE_BYTES) { await coll.updateOne({ _id }, { $set: { [`files.${index}.status`]: "error" }, updatedAt: new Date() } as never); continue; }
+              const buffer = Buffer.from(await raw.arrayBuffer());
+              const data = buffer.toString("base64");
+              if (b64Total + data.length > MAX_FILES_B64_TOTAL) { await coll.updateOne({ _id }, { $set: { [`files.${index}.status`]: "error" }, $unset: { [`files.${index}.data`]: "" }, updatedAt: new Date() } as never); continue; }
+              b64Total += data.length;
+              await coll.updateOne({ _id }, { $set: { [`files.${index}`]: { ...file, data, size: buffer.length, status: "ready" }, updatedAt: new Date() } });
+            }
+          } catch {
+            await coll.updateOne({ _id }, { $set: { [`files.${index}.status`]: "error" }, updatedAt: new Date() } as never).catch(() => {});
+          }
+        }
+      });
+    }
+
+    return Response.json({ ok: true, async: true, id: _id.toHexString(), slug: note.slug, title: note.title || (text ? `${text.slice(0, 60)}…` : "Note"), visibility, shareUrl: `/s/${note.slug}` }, { status: 202, headers: { ...CORS, "Content-Type": "application/json" } });
+  } catch (error) { return handleError(error); }
 }
