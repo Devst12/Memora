@@ -1,7 +1,9 @@
 // Floating "Save to Memora" side button injected into every page.
 // One click saves the current page (or right-clicked link) instantly with an on-screen toast.
 // The button face is the Memora logo bundled with the extension; save state shows as a small
-// badge. On SPA feeds (TikTok) the item's identity is read from the page itself with strict
+// badge. Holding the button ~2 seconds opens the composer: post text, images and documents
+// as a shareable note (public link + QR, or private). One click still saves as always.
+// On SPA feeds (TikTok) the item's identity is read from the page itself with strict
 // validation: the video nearest the viewport center is the one being watched, its ID is read
 // from surrounding DOM or the page's hydration JSON, and a save only proceeds on a stable ID.
 // When no identity can be found on a feed, the save is refused rather than storing a junk URL.
@@ -16,6 +18,8 @@ let saveTimer = null;
 let fabTop = null; // Persisted vertical position so the toast follows a dragged button.
 let lastSavedFeedId = ""; // Skip re-saves when the feed re-renders the same video.
 let lastSaveWasDuplicate = false; // Re-click after a duplicate should show the duplicate, not the feed refusal.
+let longPressTimer = null; // 2s hold opens the composer; cancelled by release, drag, or cancel events.
+let suppressClick = false; // The click that ends a long-press must not also save the page.
 
 function ensureShadow() {
   const existing = document.getElementById(HOST_ID);
@@ -45,6 +49,45 @@ function ensureShadow() {
     .m-thumb{width:44px;height:44px;border-radius:9px;object-fit:cover;background:#39423a;flex:0 0 auto}
     .m-t-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
     .m-t-meta{margin-top:3px;font-size:11.5px;color:#a9b3a5}
+    .m-composer{position:fixed;right:${EDGE_MARGIN}px;bottom:20px;width:min(420px,calc(100vw - 32px));max-height:min(660px,calc(100vh - 48px));overflow:auto;
+      background:#20251f;color:#f3f4f1;border-radius:18px;padding:16px;box-shadow:0 24px 70px -20px rgba(0,0,0,.65);
+      font:13px/1.5 system-ui,sans-serif;z-index:2;animation:m-pop .18s cubic-bezier(.2,.9,.3,1.2) both}
+    @keyframes m-pop{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+    .m-c-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+    .m-c-title{font-size:15px;font-weight:650}
+    .m-c-close,.m-c-file-x{background:none;border:none;color:#a9b3a5;font-size:18px;line-height:1;cursor:pointer;padding:4px}
+    .m-c-close:hover,.m-c-file-x:hover{color:#fff}
+    .m-c-close:disabled{opacity:.4;cursor:wait}
+    .m-c-input,.m-c-text,.m-c-select{width:100%;background:#181c16;border:1px solid #39423a;border-radius:10px;color:#f3f4f1;
+      padding:9px 11px;font:inherit;outline:none;margin-bottom:8px;box-sizing:border-box}
+    .m-c-input:focus,.m-c-text:focus,.m-c-select:focus{border-color:#7fa074}
+    .m-c-text{min-height:110px;resize:vertical}
+    .m-c-select{appearance:none;margin-bottom:0;width:auto;max-width:62%}
+    .m-c-file-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 8px}
+    .m-c-add{background:#2c332a;border:1px solid #39423a;color:#dce4d8;border-radius:9px;padding:7px 10px;font:inherit;font-size:12.5px;cursor:pointer}
+    .m-c-add:hover{border-color:#7fa074}
+    .m-c-file{display:flex;align-items:center;gap:8px;padding:6px 2px;border-bottom:1px solid #2c332a;font-size:12.5px}
+    .m-c-file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .m-c-file-state{color:#a9b3a5;font-size:11.5px;flex:none}
+    .m-c-file-state.bad{color:#d99a8b}
+    .m-c-note{min-height:18px;font-size:12px;color:#a9b3a5;margin:6px 0}
+    .m-c-note.bad{color:#d99a8b}
+    .m-c-post{width:100%;background:#4f7d58;color:#fff;border:none;border-radius:11px;padding:11px;font:inherit;font-weight:650;font-size:14px;cursor:pointer}
+    .m-c-post:hover{background:#45704e}
+    .m-c-post:disabled{opacity:.6;cursor:wait}
+    .m-share{position:fixed;right:${EDGE_MARGIN}px;bottom:20px;width:264px;background:#20251f;color:#f3f4f1;border-radius:18px;padding:16px;
+      box-shadow:0 24px 70px -20px rgba(0,0,0,.65);font:13px/1.5 system-ui,sans-serif;z-index:3;text-align:center;
+      animation:m-pop .18s cubic-bezier(.2,.9,.3,1.2) both}
+    .m-share-title{font-weight:650;margin-bottom:10px}
+    .m-share-qr{width:150px;height:150px;background:#fff;border-radius:12px;padding:6px;box-sizing:border-box;display:block;margin:0 auto}
+    .m-share-link{display:block;margin:8px 0 2px;color:#a9d0a4;font-size:11.5px;word-break:break-all;text-decoration:none}
+    .m-share-link:hover{text-decoration:underline}
+    .m-share-row{display:flex;gap:6px;margin-top:8px}
+    .m-share-btn{flex:1;background:#2c332a;border:1px solid #39423a;color:#dce4d8;border-radius:9px;padding:7px 4px;font:inherit;font-size:12px;cursor:pointer}
+    .m-share-btn:hover{border-color:#7fa074;color:#fff}
+    .m-share-close{width:100%;margin-top:8px}
+    .m-share-vis{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;font-size:12px;color:#a9b3a5;text-align:left}
+    .m-share-hint{margin-top:8px;font-size:11.5px;color:#8a938a;text-align:left}
   `;
   shadowRoot.appendChild(style);
   return { host, root: shadowRoot };
@@ -88,6 +131,318 @@ function setFab(state) {
   fab.className = `m-fab${state === "idle" ? "" : ` ${state}`}`;
   const badge = fab.querySelector(".m-badge");
   if (badge) badge.textContent = state === "ok" ? "✓" : state === "err" ? "!" : "";
+}
+
+// ---- Composer (long-press on the floating button) -----------------------------------------
+// Holding the button ~2 seconds opens a small panel: paste text, attach images
+// (compressed hard in the browser first) or documents, choose public/private,
+// then Post. The note gets a share link + QR code; the one-click save above is
+// untouched.
+
+const COMPRESS_TARGET_BYTES = 900 * 1024; // Per-image compression target (~<1MB).
+
+let composerState = null; // { files: [{file, name, kind, size, status}], visibility: "public" }
+
+// Offscreen-canvas re-encode: WebP first (smallest), quality and then size
+// ratcheted down until the result fits the target. Quality never drops below
+// 0.62, so a 60-70MB photo shrinks hard without turning into mush. Resolves
+// null when the browser can't decode the file — the original is sent instead.
+function compressImage(file) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+    createImageBitmap(file).then((bitmap) => {
+      const longest = Math.max(bitmap.width, bitmap.height);
+      let scale = Math.min(1, 2400 / longest);
+      const attempt = (quality) => {
+        if (settled) return;
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+        canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob((blob) => {
+          if (settled || !blob) return;
+          const ext = blob.type === "image/png" ? "png" : blob.type === "image/jpeg" ? "jpg" : "webp";
+          if (blob.size <= COMPRESS_TARGET_BYTES || (quality <= 0.62 && scale <= 0.4)) { bitmap.close(); return finish({ blob, name: `image.${ext}` }); }
+          if (quality > 0.62) attempt(Math.max(0.62, quality - 0.15));
+          else if (scale > 0.4) { scale *= 0.75; attempt(0.8); }
+          else { bitmap.close(); finish({ blob, name: `image.${ext}` }); }
+        }, "image/webp", quality);
+      };
+      attempt(0.85);
+    }).catch(() => resolve(null));
+  });
+}
+
+function composerAddFiles(fileList) {
+  if (!composerState) return;
+  for (const file of Array.from(fileList || [])) {
+    if (composerState.files.length >= 10) { composerNote("Up to 10 attachments per note.", true); break; }
+    const isImage = /^image\//i.test(file.type) || /\.(png|jpe?g|gif|webp|avif|bmp)$/i.test(file.name);
+    composerState.files.push({ file, name: file.name, kind: isImage ? "image" : "file", size: file.size, status: isImage ? "pending" : "ready" });
+  }
+  composerRenderFiles();
+}
+
+function composerRenderFiles() {
+  const list = shadowRoot?.getElementById("m-c-files");
+  if (!list || !composerState) return;
+  list.textContent = "";
+  composerState.files.forEach((entry, index) => {
+    const row = document.createElement("div");
+    row.className = "m-c-file";
+    const label = document.createElement("span");
+    label.className = "m-c-file-name";
+    label.textContent = `${entry.kind === "image" ? "🖼" : "📄"} ${entry.name} (${Math.max(1, Math.round(entry.size / 1024))} KB)`;
+    const state = document.createElement("span");
+    state.className = "m-c-file-state";
+    if (entry.status === "compressing") state.textContent = "compressing…";
+    else if (entry.status === "uploading") state.textContent = "uploading…";
+    else if (entry.status === "error") { state.textContent = entry.error || "failed"; state.classList.add("bad"); }
+    const remove = document.createElement("button");
+    remove.type = "button"; remove.className = "m-c-file-x"; remove.textContent = "×";
+    remove.setAttribute("aria-label", `Remove ${entry.name}`);
+    remove.addEventListener("click", () => { composerState.files.splice(index, 1); composerRenderFiles(); });
+    row.append(label, state, remove);
+    list.appendChild(row);
+  });
+}
+
+function composerNote(message, bad) {
+  const el = shadowRoot?.getElementById("m-c-note");
+  if (!el) return;
+  el.textContent = message || "";
+  el.classList.toggle("bad", Boolean(bad));
+}
+
+function closeComposer() {
+  shadowRoot.getElementById("m-composer")?.remove();
+  composerState = null;
+}
+
+function composerBusy(busy) {
+  const button = shadowRoot.getElementById("m-c-post");
+  if (button) { button.disabled = busy; button.textContent = busy ? "Posting…" : "Post"; }
+  const close = shadowRoot.getElementById("m-c-close");
+  if (close) close.disabled = busy;
+}
+
+// Fire the POST as soon as the note is stored — the server answers 202 while
+// image uploads continue in the background, so this stays instant even with
+// big files. Returns the share URL for the card below.
+async function composerPost() {
+  if (!composerState) return;
+  const text = shadowRoot.getElementById("m-c-text").value.trim();
+  const title = shadowRoot.getElementById("m-c-title").value.trim();
+  if (!text && !composerState.files.length) { composerNote("Add some text or a file first."); return; }
+  const { apiUrl, token } = await chrome.storage.local.get(["apiUrl", "token"]);
+  if (!apiUrl) { composerNote("Open the Memora popup and connect first.", true); return; }
+  composerBusy(true);
+  composerNote("Preparing attachments…");
+  const form = new FormData();
+  form.append("text", text);
+  form.append("title", title);
+  form.append("visibility", composerState.visibility);
+  form.append("sourceUrl", currentPageUrl() || location.href || "");
+  form.append("sourceTitle", (currentPageTitle() || document.title || "").slice(0, 300));
+
+  try {
+    let uploadingName = "";
+    let pending = 0;
+    for (const entry of composerState.files) {
+      if (entry.kind === "image") {
+        entry.status = "compressing"; composerRenderFiles();
+        const compressed = await compressImage(entry.file);
+        const blob = compressed?.blob || entry.file;
+        if (compressed) { entry.size = blob.size; entry.name = compressed.name; }
+        entry.status = "uploading"; composerRenderFiles();
+        pending += 1;
+        if (!uploadingName) uploadingName = entry.name;
+        form.append("files", new File([blob], entry.name, { type: blob.type || "image/webp" }));
+      } else {
+        if (entry.file.size > 8 * 1024 * 1024) throw new Error(`"${entry.name}" is over the 8MB limit for documents.`);
+        form.append("files", entry.file);
+      }
+    }
+    composerNote(pending ? `Uploading ${pending} image${pending > 1 ? "s" : ""}…` : "Posting…");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000); // The 202 arrives fast; uploads continue server-side.
+    let response, body = {};
+    try {
+      response = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/notes`, {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        credentials: "include",
+      });
+      try { body = await response.json(); } catch { /* The server's 202 hangup lands here — still a success. */ }
+    } catch (error) {
+      if (error?.name === "AbortError") { composerBusy(false); composerNote("Large upload still running — it will finish in the background. Check Memora in a moment.", true); return; }
+      throw error;
+    } finally { clearTimeout(timeout); }
+    if (response.status === 202 || (response.ok && body.async)) body.ok = true;
+    if (!response.ok && response.status !== 202) throw new Error(body.error || `Couldn't post (HTTP ${response.status}).`);
+    closeComposer();
+    setFab("ok");
+    showToast("Note posted ✓", uploadingName ? `Uploading "${uploadingName}" finishes in the background.` : "Use the link or QR code to share it.", "");
+    showShareCard({ shareUrl: body.shareUrl, slug: body.slug, id: body.id }, uploadingName);
+    setTimeout(() => setFab("idle"), 2400);
+  } catch (error) {
+    composerBusy(false);
+    composerNote(error?.message || "Couldn't post the note.", true);
+  }
+}
+
+// Bottom card with the QR code, the link, and quick actions — shown right
+// after a note is posted so sharing is one glance away.
+function showShareCard({ shareUrl, slug, id }, uploadingName) {
+  const { root } = ensureShadow();
+  root.getElementById("m-share")?.remove();
+  chrome.storage.local.get(["apiUrl"]).then(({ apiUrl }) => {
+    const origin = (apiUrl || "").replace(/\/+$/, "");
+    const url = `${origin}${shareUrl || `/s/${slug || id}`}`;
+    const card = document.createElement("div");
+    card.className = "m-share";
+    card.id = "m-share";
+    const title = document.createElement("div");
+    title.className = "m-share-title";
+    title.textContent = "Note posted — share it";
+    const qr = document.createElement("img");
+    qr.className = "m-share-qr";
+    qr.alt = "QR code";
+    qr.src = `${origin}/api/qr?data=${encodeURIComponent(url)}`;
+    const link = document.createElement("a");
+    link.className = "m-share-link";
+    link.href = url; link.target = "_blank"; link.rel = "noopener";
+    link.textContent = url;
+    const mkButton = (label, onClick) => {
+      const button = document.createElement("button");
+      button.type = "button"; button.className = "m-share-btn"; button.textContent = label;
+      button.addEventListener("click", onClick);
+      return button;
+    };
+    const row = document.createElement("div");
+    row.className = "m-share-row";
+    row.append(
+      mkButton("Copy link", async () => { try { await navigator.clipboard.writeText(url); } catch { /* Clipboard can be blocked; the link is visible above. */ } }),
+      mkButton("Open", () => window.open(url, "_blank", "noopener")),
+      mkButton("Save QR", async () => {
+        try {
+          const response = await fetch(`${origin}/api/qr?data=${encodeURIComponent(url)}&png=1`);
+          const blob = await response.blob();
+          const objectUrl = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = objectUrl; anchor.download = "memora-qr.png"; anchor.click();
+          setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
+        } catch { window.open(`${origin}/api/qr?data=${encodeURIComponent(url)}&png=1`, "_blank", "noopener"); }
+      }),
+    );
+    const visRow = document.createElement("div");
+    visRow.className = "m-share-vis";
+    const visLabel = document.createElement("span");
+    visLabel.textContent = "🌍 Public — anyone with the link";
+    const visToggle = mkButton("Make private", async () => {
+      if (!id) { visLabel.textContent = "Sign in to Memora to change visibility."; return; }
+      const next = visToggle.dataset.vis === "public" ? "private" : "public";
+      try {
+        const response = await fetch(`${origin}/api/notes/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ visibility: next }),
+        });
+        if (!response.ok) throw new Error();
+        visToggle.dataset.vis = next;
+        visToggle.textContent = next === "public" ? "Make private" : "Make public";
+        visLabel.textContent = next === "public" ? "🌍 Public — anyone with the link" : "🔒 Private — only you";
+      } catch { visLabel.textContent = "Couldn't change visibility — sign in to Memora first."; }
+    });
+    visToggle.dataset.vis = "public";
+    if (!id) visToggle.disabled = true;
+    visRow.append(visLabel, visToggle);
+    const hint = document.createElement("div");
+    hint.className = "m-share-hint";
+    hint.textContent = uploadingName ? `"${uploadingName}" finishes uploading in the background.` : "Anyone with this link or QR can view and download the note.";
+    const close = mkButton("Close", () => card.remove());
+    close.classList.add("m-share-close");
+    card.append(title, qr, link, row, visRow, hint, close);
+    root.appendChild(card);
+  });
+}
+
+function openComposer() {
+  const { root } = ensureShadow();
+  if (root.getElementById("m-composer")) return;
+  composerState = { files: [], visibility: "public" };
+  const panel = document.createElement("div");
+  panel.className = "m-composer";
+  panel.id = "m-composer";
+
+  const header = document.createElement("div");
+  header.className = "m-c-header";
+  const heading = document.createElement("div");
+  heading.className = "m-c-title";
+  heading.textContent = "Post to Memora";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "m-c-close";
+  close.id = "m-c-close";
+  close.textContent = "×";
+  close.setAttribute("aria-label", "Close composer");
+  close.addEventListener("click", closeComposer);
+  header.append(heading, close);
+
+  const title = document.createElement("input");
+  title.className = "m-c-input";
+  title.id = "m-c-title";
+  title.placeholder = "Title (optional)";
+  title.maxLength = 300;
+
+  const textarea = document.createElement("textarea");
+  textarea.className = "m-c-text";
+  textarea.id = "m-c-text";
+  textarea.placeholder = "Paste text or notes…";
+  textarea.maxLength = 50000;
+
+  const fileRow = document.createElement("div");
+  fileRow.className = "m-c-file-row";
+  const fileButton = document.createElement("button");
+  fileButton.type = "button";
+  fileButton.className = "m-c-add";
+  fileButton.textContent = "+ Add images or files";
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.multiple = true;
+  fileInput.accept = "image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json,.rtf,.xls,.xlsx,.ppt,.pptx";
+  fileInput.style.display = "none";
+  fileInput.addEventListener("change", () => { composerAddFiles(fileInput.files); fileInput.value = ""; });
+  fileButton.addEventListener("click", () => fileInput.click());
+  const visibility = document.createElement("select");
+  visibility.className = "m-c-select";
+  visibility.innerHTML = `<option value="public">🌍 Public — anyone with the link</option><option value="private">🔒 Private — only you</option>`;
+  visibility.addEventListener("change", () => { if (composerState) composerState.visibility = visibility.value; });
+  fileRow.append(fileButton, visibility);
+
+  const files = document.createElement("div");
+  files.className = "m-c-files";
+  files.id = "m-c-files";
+
+  const note = document.createElement("div");
+  note.className = "m-c-note";
+  note.id = "m-c-note";
+
+  const post = document.createElement("button");
+  post.type = "button";
+  post.className = "m-c-post";
+  post.id = "m-c-post";
+  post.textContent = "Post";
+  post.addEventListener("click", composerPost);
+
+  panel.addEventListener("keydown", (event) => { if (event.key === "Escape") closeComposer(); });
+  panel.append(header, title, textarea, fileRow, fileInput, files, note, post);
+  root.appendChild(panel);
+  setTimeout(() => textarea.focus(), 30);
 }
 
 function describe(result) {
@@ -462,24 +817,35 @@ function mount() {
   fab.append(logo, badge);
   // Drag vertically along the right edge so it never blocks content; a real drag must not trigger a save.
   let dragging = false, moved = false, startY = 0, startTop = 0;
+  const cancelLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } };
   fab.addEventListener("pointerdown", (event) => {
     dragging = true;
     moved = false;
+    suppressClick = false;
     startY = event.clientY;
     startTop = fab.getBoundingClientRect().top;
     fab.setPointerCapture(event.pointerId);
+    // Hold ~2s to open the composer; a quick release still saves instantly.
+    cancelLongPress();
+    longPressTimer = setTimeout(() => {
+      longPressTimer = null;
+      suppressClick = true; // The click that ends this hold must not save.
+      openComposer();
+    }, 2000);
   });
   fab.addEventListener("pointermove", (event) => {
     if (!dragging) return;
     const delta = event.clientY - startY;
-    if (Math.abs(delta) > 6) moved = true;
+    if (Math.abs(delta) > 6) { moved = true; cancelLongPress(); } // Dragging cancels the hold.
     if (moved) {
       const max = window.innerHeight - 56;
       fab.style.top = `${Math.min(Math.max(startTop + delta, 12), max)}px`;
     }
   });
-  fab.addEventListener("pointerup", () => { dragging = false; });
+  fab.addEventListener("pointerup", () => { dragging = false; cancelLongPress(); });
+  fab.addEventListener("pointercancel", () => { dragging = false; cancelLongPress(); });
   fab.addEventListener("click", (event) => {
+    if (suppressClick) { suppressClick = false; return; } // Long-press just opened the composer.
     if (moved) { moved = false; return; } // drag ended here — don't treat as a click
     event.preventDefault();
     event.stopPropagation();
