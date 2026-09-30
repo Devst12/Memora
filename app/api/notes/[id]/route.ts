@@ -6,6 +6,14 @@ import { MAX_TITLE_LENGTH, notesCollection, serializeNote } from "@/lib/notes";
 
 export const runtime = "nodejs";
 
+// The extension's share card flips visibility from any page, so these
+// responses must carry CORS headers or the browser blocks the answer.
+const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, PATCH, DELETE, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" };
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: CORS });
+}
+
 // Public/private read. Anonymous users only see public notes; the owner (via
 // dashboard session or their extension token) can read either — and private
 // notes only exist at this URL for them.
@@ -25,7 +33,7 @@ export async function GET(request: Request, context: RouteContext<"/api/notes/[i
       const viewer = await currentUser(request).catch(() => null);
       isOwner = Boolean(viewer && viewer._id.equals(note.userId));
     }
-    return Response.json({ note: serializeNote(note), isOwner, shareUrl: `/s/${note.slug}` });
+    return Response.json({ note: serializeNote(note), isOwner, shareUrl: `/s/${note.slug}` }, { headers: CORS });
   } catch (error) { return handleError(error); }
 }
 
@@ -45,7 +53,7 @@ export async function PATCH(request: Request, context: RouteContext<"/api/notes/
     if (Object.keys(set).length === 1) return jsonError("Nothing to update.");
     const result = await notesCollection(await database()).updateOne({ _id: new ObjectId(id), userId: user._id }, { $set: set });
     if (!result.matchedCount) return jsonError("Note not found.", 404);
-    return Response.json({ ok: true });
+    return Response.json({ ok: true }, { headers: CORS });
   } catch (error) { return handleError(error); }
 }
 
