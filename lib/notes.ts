@@ -25,6 +25,7 @@ export type StoredFile = {
   url?: string; // images hosted on imgbb
   thumbUrl?: string;
   data?: string; // base64 bytes for non-image files kept in the document
+  status?: "uploading" | "ready" | "error"; // uploads finish after the note is created
 };
 
 export type NoteDoc = {
@@ -90,6 +91,7 @@ export function serializeNote(note: NoteDoc) {
       type: f.type,
       size: f.size,
       kind: f.kind,
+      status: f.status || "ready",
       url: f.url || (f.data && f.kind === "image" ? `/api/notes/${noteId}/files/${f.id}` : ""),
       thumbUrl: f.thumbUrl || "",
     })),
