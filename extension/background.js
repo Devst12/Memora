@@ -1,6 +1,8 @@
 // Service worker: performs saves for the floating button and right-click menu, tracks badge feedback.
 // The content script never trusts location.href — SPA sites like TikTok keep the address bar
 // stale or bare (tiktok.com while scrolling a feed), so the real URL is resolved here per tab.
+// Long-press on the floating button opens the composer; that flow POSTs /api/notes straight from
+// the page (FormData can't cross the messaging bridge) with the token handed over below.
 
 async function capture({ apiUrl, token }, payload) {
   const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/extension/capture`, {
@@ -92,6 +94,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "memora-save") {
     save(message, sender).then(sendResponse);
     return true; // keep the message channel open for the async response
+  }
+  // Composer (long-press): keep the token fresh and hand back the API origin +
+  // saved credentials so the content script can POST /api/notes itself. The
+  // fetch must run in the page context — the SW can't proxy huge FormData.
+  if (message?.type === "memora-composer-context") {
+    chrome.storage.local.get(["apiUrl", "token"]).then((stored) => {
+      sendResponse({ apiUrl: stored.apiUrl || "", token: stored.token || "" });
+    });
+    return true;
   }
 });
 
