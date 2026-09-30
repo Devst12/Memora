@@ -269,17 +269,23 @@ async function composerPost() {
     const timeout = setTimeout(() => controller.abort(), 15000); // The 202 arrives fast; uploads continue server-side.
     let response, body = {};
     try {
+      // Token auth (no cookies): the app's CORS policy answers simple token
+      // requests from any origin, while credentialed ones can never succeed.
       response = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/notes`, {
         method: "POST",
         body: form,
         signal: controller.signal,
         headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-        credentials: "include",
       });
       try { body = await response.json(); } catch { /* The server's 202 hangup lands here — still a success. */ }
     } catch (error) {
       if (error?.name === "AbortError") { composerBusy(false); composerNote("Large upload still running — it will finish in the background. Check Memora in a moment.", true); return; }
-      throw error;
+      // "Failed to fetch" means the app never answered: offline, or the server
+      // hasn't been redeployed since the composer was added (it 404s without
+      // CORS headers, which the browser reports as exactly this error).
+      composerBusy(false);
+      composerNote(`Can't reach ${apiUrl}. Check your connection — and if Memora's server hasn't been redeployed since the composer shipped, update it first.`, true);
+      return;
     } finally { clearTimeout(timeout); }
     if (response.status === 202 || (response.ok && body.async)) body.ok = true;
     if (!response.ok && response.status !== 202) throw new Error(body.error || `Couldn't post (HTTP ${response.status}).`);
@@ -299,7 +305,7 @@ async function composerPost() {
 function showShareCard({ shareUrl, slug, id }, uploadingName) {
   const { root } = ensureShadow();
   root.getElementById("m-share")?.remove();
-  chrome.storage.local.get(["apiUrl"]).then(({ apiUrl }) => {
+  chrome.storage.local.get(["apiUrl", "token"]).then(({ apiUrl, token }) => {
     const origin = (apiUrl || "").replace(/\/+$/, "");
     const url = `${origin}${shareUrl || `/s/${slug || id}`}`;
     const card = document.createElement("div");
@@ -348,15 +354,14 @@ function showShareCard({ shareUrl, slug, id }, uploadingName) {
       try {
         const response = await fetch(`${origin}/api/notes/${id}`, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token || ""}` },
           body: JSON.stringify({ visibility: next }),
         });
         if (!response.ok) throw new Error();
         visToggle.dataset.vis = next;
         visToggle.textContent = next === "public" ? "Make private" : "Make public";
         visLabel.textContent = next === "public" ? "🌍 Public — anyone with the link" : "🔒 Private — only you";
-      } catch { visLabel.textContent = "Couldn't change visibility — sign in to Memora first."; }
+      } catch { visLabel.textContent = "Couldn't change visibility — open the Memora popup and reconnect."; }
     });
     visToggle.dataset.vis = "public";
     if (!id) visToggle.disabled = true;
