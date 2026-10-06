@@ -22,6 +22,7 @@ let longPressTimer = null; // 2s hold opens the composer; cancelled by release, 
 let suppressClick = false; // The click that ends a long-press must not also save the page.
 let sharePollTimer = null; // Upload-status polling for the share card.
 let sharePollId = ""; // Note id the current poll belongs to.
+let composerEpoch = 0; // Bumped whenever the composer opens/closes so a stale upload loop dies quietly.
 
 function ensureShadow() {
   const existing = document.getElementById(HOST_ID);
@@ -72,6 +73,8 @@ function ensureShadow() {
     .m-c-file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .m-c-file-state{color:#a9b3a5;font-size:11.5px;flex:none}
     .m-c-file-state.bad{color:#d99a8b}
+    .m-c-file-retry{background:none;border:1px solid #39423a;color:#dce4d8;border-radius:8px;font:inherit;font-size:11px;padding:3px 7px;cursor:pointer;flex:none}
+    .m-c-file-retry:hover{border-color:#7fa074;color:#fff}
     .m-c-note{min-height:18px;font-size:12px;color:#a9b3a5;margin:6px 0}
     .m-c-note.bad{color:#d99a8b}
     .m-c-post{width:100%;background:#4f7d58;color:#fff;border:none;border-radius:11px;padding:11px;font:inherit;font-weight:650;font-size:14px;cursor:pointer}
@@ -154,6 +157,9 @@ function setFab(state) {
 // untouched.
 
 const COMPRESS_TARGET_BYTES = 900 * 1024; // Per-image compression target (~<1MB).
+// The per-file body ceiling mirrors the server's cap (lib/notes.ts): serverless
+// platforms reject request bodies over ~4.5MB, so every upload must stay below.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 // One-tap share targets for the networks people actually post to. `url` builds
 // the network's prefilled share endpoint; WhatsApp uses the plain text form.
@@ -167,7 +173,7 @@ const SHARE_TARGETS = [
   { name: "Email", icon: "@", url: (link, text) => `mailto:?subject=${encodeURIComponent(text)}&body=${encodeURIComponent(link)}` },
 ];
 
-let composerState = null; // { files: [{file, name, kind, size, status}], visibility: "public" }
+let composerState = null; // { files: [{file, blob, name, sendName, sendType, kind, size, slot, status, error?, controller?}], visibility, posted, postedNoteId }
 
 // Offscreen-canvas re-encode: WebP first (smallest), quality and then size
 // ratcheted down until the result fits the target. Quality never drops below
@@ -205,7 +211,7 @@ function composerAddFiles(fileList) {
   for (const file of Array.from(fileList || [])) {
     if (composerState.files.length >= 10) { composerNote("Up to 10 attachments per note.", true); break; }
     const isImage = /^image\//i.test(file.type) || /\.(png|jpe?g|gif|webp|avif|bmp)$/i.test(file.name);
-    composerState.files.push({ file, name: file.name, kind: isImage ? "image" : "file", size: file.size, status: isImage ? "pending" : "ready" });
+    composerState.files.push({ file, name: file.name, kind: isImage ? "image" : "file", size: file.size, status: "pending" });
   }
   composerRenderFiles();
   composerSyncPost();
@@ -224,21 +230,39 @@ function composerRenderFiles() {
     const state = document.createElement("span");
     state.className = "m-c-file-state";
     if (entry.status === "compressing") state.textContent = "compressing…";
+    else if (entry.status === "queued") state.textContent = "waiting…";
     else if (entry.status === "uploading") state.textContent = "uploading…";
+    else if (entry.status === "done") state.textContent = "✓ uploaded";
     else if (entry.status === "error") { state.textContent = entry.error || "failed"; state.classList.add("bad"); }
-    const remove = document.createElement("button");
-    remove.type = "button"; remove.className = "m-c-file-x"; remove.textContent = "×";
-    remove.setAttribute("aria-label", `Remove ${entry.name}`);
-    remove.addEventListener("click", () => { composerState.files.splice(index, 1); composerRenderFiles(); composerSyncPost(); });
-    row.append(label, state, remove);
+    row.append(label, state);
+    // A failed attachment retries on its own — the bytes are still here, the
+    // server just said no once (flaky network, transient 5xx, rate limit).
+    if (entry.status === "error" && composerState.posted && entry.blob) {
+      const retry = document.createElement("button");
+      retry.type = "button"; retry.className = "m-c-file-retry"; retry.textContent = "↻ Retry";
+      retry.setAttribute("aria-label", `Retry ${entry.name}`);
+      retry.addEventListener("click", () => { if (!entry.busy) retryUpload(entry); });
+      row.append(retry);
+    }
+    // Once posted, the files are committed to the note — they can only be
+    // retried or left out, not pulled from the manifest any more.
+    if (!composerState.posted) {
+      const remove = document.createElement("button");
+      remove.type = "button"; remove.className = "m-c-file-x"; remove.textContent = "×";
+      remove.setAttribute("aria-label", `Remove ${entry.name}`);
+      remove.addEventListener("click", () => { composerState.files.splice(index, 1); composerRenderFiles(); composerSyncPost(); });
+      row.append(remove);
+    }
     list.appendChild(row);
   });
 }
 
-// Post unlocks as soon as the note has any text or any attachment.
+// Post unlocks as soon as the note has any text or any attachment. Once the
+// note is posted, the button is driven by the upload phases instead.
 function composerSyncPost() {
   const post = shadowRoot?.getElementById("m-c-post");
   if (!post || !composerState) return;
+  if (composerState.posted) { post.disabled = true; return; }
   const text = shadowRoot.getElementById("m-c-text").value.trim();
   post.disabled = !text && !composerState.files.length;
 }
@@ -251,7 +275,9 @@ function composerNote(message, bad) {
 }
 
 function closeComposer() {
+  composerEpoch += 1; // Any upload loop still running sees the epoch change and stops.
   shadowRoot.getElementById("m-composer")?.remove();
+  for (const entry of composerState?.files || []) { try { entry.controller?.abort(); } catch { /* Already gone. */ } }
   composerState = null;
 }
 
@@ -262,61 +288,114 @@ function composerBusy(busy) {
   if (close) close.disabled = busy;
 }
 
+function composerPhase(label, disabled) {
+  const button = shadowRoot.getElementById("m-c-post");
+  if (button) { button.disabled = disabled; button.textContent = label; }
+}
+
+// After the note is posted the fields are done: lock them so late edits can't
+// suggest they would change anything.
+function composerLockInputs(locked) {
+  for (const id of ["m-c-title", "m-c-text"]) { const el = shadowRoot.getElementById(id); if (el) el.disabled = locked; }
+  const select = shadowRoot.querySelector(".m-c-select"); if (select) select.disabled = locked;
+  const add = shadowRoot.querySelector(".m-c-add"); if (add) add.disabled = locked;
+}
+
+// Post in three stages so the text can never be lost to a bad attachment:
+// 1) shrink images locally and drop anything that can't survive the trip;
+// 2) post the note itself as a tiny JSON request — the share link comes back
+//    immediately and works before any attachment lands;
+// 3) upload the files one per request with live status and per-file retry, so
+//    one oversized or flaky file can't sink the rest (or the text).
+
 // Stop the share card's upload polling when the card goes away.
 function stopSharePoll() {
   if (sharePollTimer) { clearInterval(sharePollTimer); sharePollTimer = null; }
   sharePollId = "";
 }
 
-// Post immediately: the note (text, title, visibility) is stored and the server
-// answers with the real share link in one round trip while attachments upload
-// afterwards on the server.
 async function composerPost() {
   if (!composerState) return;
+  // Before posting the button posts; after, it closes the finished panel.
+  if (composerState.posted) { closeComposer(); return; }
   const text = shadowRoot.getElementById("m-c-text").value.trim();
   const title = shadowRoot.getElementById("m-c-title").value.trim();
   if (!text && !composerState.files.length) { composerNote("Add some text or a file first."); return; }
   const { apiUrl, token } = await chrome.storage.local.get(["apiUrl", "token"]);
-  if (!apiUrl || !token) { composerNote("Open the Memora popup and connect first.", true); return; }
+  if (!apiUrl || !token) {
+    composerNote("Memora isn't connected — click the Memora toolbar icon, paste your app URL and capture token, then post again.", true);
+    return;
+  }
+  const origin = apiUrl.replace(/\/+$/, "");
+  composerState.posted = true;
+  composerLockInputs(true);
   composerBusy(true);
-  composerNote(composerState.files.length ? "Compressing & posting…" : "Posting…");
-  const form = new FormData();
-  form.append("text", text);
-  form.append("title", title);
-  form.append("visibility", composerState.visibility);
-  form.append("sourceUrl", currentPageUrl() || location.href || "");
-  form.append("sourceTitle", (currentPageTitle() || document.title || "").slice(0, 300));
+  const epoch = composerEpoch;
+  const alive = () => epoch === composerEpoch && composerState;
 
-  try {
-    for (const entry of composerState.files) {
-      if (entry.kind === "image") {
-        entry.status = "compressing"; composerRenderFiles();
-        const compressed = await compressImage(entry.file);
-        const blob = compressed?.blob || entry.file;
-        const name = compressed?.name || entry.name;
-        entry.status = "ready"; composerRenderFiles();
-        form.append("files", new File([blob], name, { type: blob.type || "image/webp" }));
-      } else {
-        if (entry.file.size > 8 * 1024 * 1024) throw new Error(`"${entry.name}" is over the 8MB limit for documents.`);
-        form.append("files", entry.file, entry.name);
+  // Stage 1 — shrink images and refuse, locally, anything the server could
+  // never accept. Failures here are per-file: the note itself still posts.
+  const manifest = [];
+  for (let index = 0; index < composerState.files.length; index += 1) {
+    const entry = composerState.files[index];
+    if (entry.kind === "image") {
+      entry.status = "compressing"; composerRenderFiles();
+      const compressed = await compressImage(entry.file);
+      if (!alive()) return;
+      if (!compressed || compressed.blob.size > MAX_UPLOAD_BYTES) {
+        // Never fall back to the original file: a 60MB photo can only fail
+        // server-side. Saying so here beats a silent, unexplained loss.
+        entry.status = "error";
+        entry.error = "Couldn't process this image — try a different file.";
+        continue;
       }
+      entry.blob = compressed.blob;
+      entry.sendName = compressed.name;
+      entry.sendType = compressed.blob.type || "image/webp";
+    } else {
+      if (entry.file.size > MAX_UPLOAD_BYTES) {
+        entry.status = "error";
+        entry.error = `Over the ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB limit for documents.`;
+        continue;
+      }
+      entry.blob = entry.file;
+      entry.sendName = entry.name;
+      entry.sendType = entry.file.type || "application/octet-stream";
     }
+    entry.status = "queued";
+    entry.slot = manifest.length; // Position in the server's placeholder list.
+    manifest.push({ name: entry.sendName, type: entry.sendType, size: entry.blob.size, kind: entry.kind });
+  }
+  if (alive()) { composerRenderFiles(); if (manifest.length) composerNote("Posting…"); }
+
+  // Stage 2 — the note itself: a tiny JSON body that stays far under any
+  // request-size cap, so the text can no longer be lost to a big attachment.
+  let noteId = "", shareUrl = "";
+  try {
     // Token auth, no cookies: the app's CORS policy answers simple token
     // requests from any origin, while credentialed ones can never succeed.
-    const response = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/notes`, {
+    const response = await fetch(`${origin}/api/notes`, {
       method: "POST",
-      body: form,
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        text, title,
+        visibility: composerState.visibility,
+        sourceUrl: currentPageUrl() || location.href || "",
+        sourceTitle: (currentPageTitle() || document.title || "").slice(0, 300),
+        files: manifest,
+      }),
     });
+    if (!alive()) return;
     let body = {};
     try { body = await response.json(); } catch { /* Non-JSON error bodies fall through. */ }
-    if (!response.ok && response.status !== 202) throw new Error(body.error || `Couldn't post (HTTP ${response.status}).`);
-    closeComposer();
-    setFab("ok");
-    showToast("Note posted ✓", "Share it with the link, QR code, or share buttons.", "");
-    showShareCard({ shareUrl: body.shareUrl, slug: body.slug, id: body.id });
-    setTimeout(() => setFab("idle"), 2400);
+    if (response.status !== 202 && !response.ok) throw new Error(body.error || `Couldn't post (HTTP ${response.status}).`);
+    noteId = body.id || "";
+    shareUrl = body.shareUrl || "";
+    if (!noteId) throw new Error("The server didn't return a note id.");
   } catch (error) {
+    if (!alive()) return;
+    composerState.posted = false;
+    composerLockInputs(false);
     composerBusy(false);
     // "Failed to fetch" means the app never answered: offline, or the server
     // hasn't been redeployed since the composer shipped (it 404s without CORS
@@ -324,7 +403,109 @@ async function composerPost() {
     composerNote(/failed to fetch/i.test(String(error?.message))
       ? `Can't reach ${apiUrl}. Check your connection — and redeploy the Memora server if it hasn't been updated since the composer shipped.`
       : error?.message || "Couldn't post the note.", true);
+    return;
   }
+  composerState.postedNoteId = noteId;
+
+  // The link is live the moment the text lands — share it while files upload.
+  if (alive()) {
+    setFab("ok");
+    showToast("Note posted ✓", "Share it with the link, QR code, or share buttons.", "");
+    showShareCard({ shareUrl, slug: "", id: noteId });
+    setTimeout(() => setFab("idle"), 2400);
+  }
+
+  // Stage 3 — attachments, one request each.
+  await uploadComposerFiles(origin, token, noteId, epoch);
+}
+
+// Upload every queued attachment in order; finish with a clear state — all
+// done (panel closes itself) or a per-file failure list with Retry buttons.
+async function uploadComposerFiles(origin, token, noteId, epoch) {
+  const alive = () => epoch === composerEpoch && composerState;
+  const queue = (composerState?.files || []).filter((entry) => entry.status === "queued");
+  if (!queue.length) {
+    if (alive()) { composerNote(""); composerPhase("Done ✓", false); setTimeout(() => { if (alive()) closeComposer(); }, 1400); }
+    return;
+  }
+  if (alive()) { composerNote(`Uploading ${queue.length} file${queue.length > 1 ? "s" : ""}…`); composerPhase("Uploading…", true); }
+  for (const entry of queue) {
+    if (!alive()) return;
+    await uploadOne(origin, token, noteId, entry, alive);
+  }
+  if (!alive()) return;
+  settleComposer();
+}
+
+// Final composer state after (re)uploads settle: auto-close when everything
+// landed, otherwise keep the panel open with its Retry buttons.
+function settleComposer() {
+  if (!composerState) return;
+  const failed = composerState.files.filter((entry) => entry.status === "error").length;
+  if (failed) {
+    composerNote(`${failed} file${failed > 1 ? "s" : ""} failed — tap ↻ Retry on them, or close and try again later.`, true);
+    composerPhase("Close", false);
+  } else {
+    composerNote("All files uploaded ✓");
+    composerPhase("Done ✓", false);
+    const epoch = composerEpoch;
+    setTimeout(() => { if (composerState && epoch === composerEpoch) closeComposer(); }, 1600);
+  }
+}
+
+// One file, one request, one automatic retry for transient failures. Returns
+// true when the server confirmed the upload.
+async function uploadOne(origin, token, noteId, entry, alive) {
+  entry.status = "uploading";
+  entry.busy = true;
+  delete entry.error;
+  if (alive()) composerRenderFiles();
+  entry.controller = new AbortController();
+  let ok = false;
+  for (let attempt = 0; attempt < 2 && !ok; attempt += 1) {
+    try {
+      const form = new FormData();
+      form.append("file", new File([entry.blob], entry.sendName, { type: entry.sendType }));
+      form.append("index", String(entry.slot));
+      const response = await fetch(`${origin}/api/notes/${noteId}/files`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+        signal: entry.controller.signal,
+      });
+      let body = {};
+      try { body = await response.json(); } catch { /* Non-JSON error bodies fall through. */ }
+      if (response.ok) { ok = true; break; }
+      // A 4xx (except timeouts and rate limits) won't improve on retry —
+      // surface the server's own message instead of burning the attempt.
+      if (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429) {
+        entry.error = body.error || `Upload failed (HTTP ${response.status}).`;
+        break;
+      }
+      throw new Error(body.error || `Upload failed (HTTP ${response.status}).`);
+    } catch (error) {
+      if (error?.name === "AbortError" || !alive()) break;
+      if (attempt === 1) {
+        entry.error = /failed to fetch/i.test(String(error?.message)) ? "Couldn't reach the server." : (error?.message || "Upload failed.");
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1200)); // Brief pause, then the one retry.
+    }
+  }
+  entry.busy = false;
+  entry.status = ok ? "done" : "error";
+  if (alive()) composerRenderFiles();
+  return ok;
+}
+
+// Manual retry from the ↻ button on a failed row.
+async function retryUpload(entry) {
+  const { apiUrl, token } = await chrome.storage.local.get(["apiUrl", "token"]);
+  if (!apiUrl || !token || !composerState?.postedNoteId || !entry.blob || entry.busy) return;
+  const epoch = composerEpoch;
+  await uploadOne(apiUrl.replace(/\/+$/, ""), token, composerState.postedNoteId, entry, () => epoch === composerEpoch && composerState);
+  if (epoch !== composerEpoch || !composerState) return;
+  settleComposer();
 }
 
 // Bottom card shown right after a note is posted: Share (platform targets),
@@ -444,8 +625,16 @@ function showShareCard({ shareUrl, slug, id, title: noteTitle }) {
 
     if (id) {
       sharePollId = id;
+      const pollStarted = Date.now();
       sharePollTimer = setInterval(async () => {
         if (!sharePollId || !root.getElementById("m-share")) { stopSharePoll(); return; }
+        // Stop after five minutes: a healthy note settles in seconds, and a
+        // forgotten card must not ping the server forever.
+        if (Date.now() - pollStarted > 5 * 60 * 1000) {
+          stopSharePoll();
+          hint.textContent = "Uploads are taking longer than expected — check the note in your Memora in a minute.";
+          return;
+        }
         try {
           const response = await fetch(`${origin}/api/notes/${id}`, { headers: { Authorization: `Bearer ${token || ""}` } });
           if (!response.ok) return;
@@ -455,7 +644,11 @@ function showShareCard({ shareUrl, slug, id, title: noteTitle }) {
           const failed = files.filter((f) => f.status === "error").length;
           if (!uploading) {
             stopSharePoll();
-            hint.textContent = failed ? `${failed} attachment${failed > 1 ? "s" : ""} failed to upload — retry from your Memora notes.` : files.length ? "All attachments uploaded ✓" : "Anyone with this link or QR can view the note.";
+            if (failed) {
+              hint.textContent = root.getElementById("m-composer")
+                ? `${failed} attachment${failed > 1 ? "s" : ""} failed — tap ↻ Retry in the posting panel.`
+                : `${failed} attachment${failed > 1 ? "s" : ""} failed to upload — post them again with the Memora composer.`;
+            } else hint.textContent = files.length ? "All attachments uploaded ✓" : "Anyone with this link or QR can view the note.";
           } else hint.textContent = `Uploading attachments… ${files.length - uploading}/${files.length} done`;
         } catch { /* Transient poll errors just wait for the next tick. */ }
       }, 2500);

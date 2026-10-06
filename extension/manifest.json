@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Memora \u2014 Save to Memory",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "description": "Save anything with one click \u2014 a floating save button on every page. Hold it to post text, images and files as a shareable note.",
   "permissions": [
     "activeTab",

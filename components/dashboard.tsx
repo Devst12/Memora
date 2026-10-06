@@ -298,7 +298,7 @@ function NotesPanel({ notes, loading, onToggleVisibility, onDelete }: { notes: N
                   <li key={file.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-raised)] px-3 py-2 text-sm">
                     <span className="min-w-0 flex-1 truncate">{file.kind === "image" ? "🖼" : "📄"} {file.name} <span className="text-xs text-[var(--ink-faint)]">({file.size < 1048576 ? `${Math.round(file.size / 1024)} KB` : `${(file.size / 1048576).toFixed(1)} MB`})</span></span>
                     {file.status === "uploading" ? <span className="chip flex-none bg-[var(--amber-soft)] text-[var(--amber-ink)]">uploading…</span>
-                      : file.status === "error" ? <span className="chip flex-none bg-[var(--danger-soft)] text-[var(--danger)]">failed</span>
+                      : file.status === "error" ? <span className="chip flex-none bg-[var(--danger-soft)] text-[var(--danger)]" title="This upload didn't finish — post the file again with the Memora extension.">failed</span>
                       : <span className="flex flex-none gap-2">
                           {file.url ? <a href={file.url} target="_blank" rel="noopener noreferrer" className="secondary !min-h-0 px-3 py-1.5 text-xs">View</a> : null}
                           <a href={file.url ? file.url : `/api/notes/${note.id}/files/${file.id}?download=1`} download={file.name} className="primary !min-h-0 px-3 py-1.5 text-xs">Download</a>
