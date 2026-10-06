@@ -18,16 +18,11 @@ function isPlatformRoot(normalizedUrl: string) {
   } catch { return false; }
 }
 
-// These platforms are client-rendered enough that a server-side fetch is either blocked, slow,
-// or returns a generic shell page. When the extension already sent a real title, skip the fetch
-// entirely rather than pay its latency (or its timeout) for data we're about to discard anyway.
-const CLIENT_AUTHORITATIVE = new Set(["tiktok.com", "douyin.com", "instagram.com", "facebook.com", "x.com", "twitter.com", "pinterest.com", "reddit.com"]);
-function isClientAuthoritative(normalizedUrl: string) {
-  try { return CLIENT_AUTHORITATIVE.has(new URL(normalizedUrl).hostname.replace(/^www\./, "")); } catch { return false; }
-}
-
-// One-shot capture for the floating side button: save immediately, categorize in the background.
-// Explicit fields from the popup form still win when provided; everything else is automatic.
+// One-shot capture for the floating side button and the phone's share sheet:
+// save immediately, enrich in the background. The response goes out the moment
+// the item exists — title, thumbnail and tags are pulled from the URL
+// afterwards, so sharing from a phone feels instant no matter how slow the
+// platform's servers are.
 export async function POST(request: Request) {
   try {
     const user = await currentUser(request); if (!user) return jsonError("Extension token is invalid or revoked.", 401);
@@ -42,30 +37,14 @@ export async function POST(request: Request) {
       return Response.json({ duplicate: true, itemId: duplicate._id.toHexString(), title: duplicate.title, platform: duplicate.platform, message: "Already in your memory." }, { status: 409 });
     }
 
-    const hasClientData = Boolean(safeText(body.title, 300) && safeText(body.description, 2000));
-    // Skip the network round trip entirely when it would just be discarded — this is most of
-    // the delay on TikTok/Douyin/Instagram, where the fetch is slow, blocked, or both.
-    let metadata: Awaited<ReturnType<typeof fetchMetadata>> = {};
-    if (!(isClientAuthoritative(normalized) && hasClientData)) {
-      try { metadata = await fetchMetadata(normalized); } catch { /* URL remains saveable without metadata. */ }
-    }
-    let canonicalUrl = normalized;
-    if (metadata.canonicalUrl) { try { canonicalUrl = normalizeUrl(metadata.canonicalUrl); } catch { /* Ignore invalid canonical metadata. */ } }
-    if (canonicalUrl !== normalized) {
-      const canonicalDuplicate = await coll.findOne({ userId: user._id, canonicalUrl });
-      if (canonicalDuplicate) {
-        return Response.json({ duplicate: true, itemId: canonicalDuplicate._id.toHexString(), title: canonicalDuplicate.title, platform: canonicalDuplicate.platform, message: "Already in your memory." }, { status: 409 });
-      }
-    }
     const platform = detectPlatform(normalized);
     const keywords = Array.isArray(body.keywords) ? body.keywords.map((x: unknown) => safeText(x, 60)).filter(Boolean).slice(0, 12) : [];
-    const title = safeText(body.title, 300) || metadata.title || new URL(normalized).hostname;
-    const pageTitle = safeText(body.pageTitle, 300) || title;
-    const description = safeText(body.description, 2000) || metadata.description || "";
-    const authorName = safeText(body.author, 120) || metadata.authorName || "";
-    let thumbnailUrl = metadata.thumbnailUrl || "";
+    const title = safeText(body.title, 300);
+    const description = safeText(body.description, 2000);
+    const authorName = safeText(body.author, 120);
+    let thumbnailUrl = "";
     const clientThumb = safeText(body.thumbnailUrl, 1000);
-    if (!thumbnailUrl && /^https:\/\/[^\s]+$/i.test(clientThumb) && !clientThumb.includes("tiktok.com/404")) thumbnailUrl = clientThumb;
+    if (/^https:\/\/[^\s]+$/i.test(clientThumb) && !clientThumb.includes("tiktok.com/404")) thumbnailUrl = clientThumb;
 
     const explicitCategory = ObjectId.isValid(body.categoryId) ? await db.collection("categories").findOne({ _id: new ObjectId(body.categoryId), userId: user._id }) : null;
     if (body.categoryId && ObjectId.isValid(body.categoryId) && !explicitCategory) return jsonError("Choose one of your categories.");
@@ -74,13 +53,14 @@ export async function POST(request: Request) {
       : null;
 
     const now = new Date();
-    // Insert right away with whatever we already know for certain. When the caller didn't pin a
-    // category or tags, those two fields start empty and are filled in after the response below —
-    // that's the only part allowed to take its time.
+    // Insert right away with whatever the caller already gave us — no network
+    // fetch happens before the response. Whatever the URL can still tell us
+    // (real title, thumbnail, description, author, tags) is filled in just
+    // after the response below.
     const item = {
-      userId: user._id, url: normalized, canonicalUrl, platform,
+      userId: user._id, url: normalized, canonicalUrl: normalized, platform,
       contentType: safeText(body.contentType, 30) || "other",
-      title, description, thumbnailUrl, authorName, authorUrl: "",
+      title: title || new URL(normalized).hostname, description, thumbnailUrl, authorName, authorUrl: "",
       notes: safeText(body.notes, 5000), status: "unread",
       reason: safeText(body.reason, 50) || "",
       categoryId: explicitCategory?._id || null, categoryName: explicitCategory?.name || "",
@@ -93,29 +73,64 @@ export async function POST(request: Request) {
       await Promise.all(explicitTags.map((name) => db.collection("tags").updateOne({ userId: user._id, name }, { $setOnInsert: { userId: user._id, name, createdAt: now } }, { upsert: true })));
     }
 
-    // Everything below runs after the response has already gone out — the click returns the
-    // moment the item exists, and the category/reason/auto-tags fill themselves in right after.
-    if (!explicitCategory || !explicitTags) {
+    // Background enrichment, running after the response has already gone out.
+    // Fetches the page's own metadata (fills only what's missing), re-checks
+    // duplicates against the canonical address, then lets the auto-tagger fill
+    // category/reason/tags. Best-effort throughout: the save itself is done.
+    const needsMetadata = Boolean(!title || !thumbnailUrl || !description);
+    const needsSuggestions = !explicitCategory || !explicitTags;
+    if (needsMetadata || needsSuggestions) {
       after(async () => {
         try {
-          const categories = (await db.collection("categories").find({ userId: user._id }).project({ name: 1, _id: 0 }).toArray()).map(({ name }) => name);
-          const rules = (await db.collection("category_rules").find({ userId: user._id }).sort({ createdAt: 1 }).toArray()).map(({ categoryName, keywords: ruleKeywords }) => ({ categoryName, keywords: Array.isArray(ruleKeywords) ? ruleKeywords : [] }));
-          const suggestion = suggestMeta({ url: normalized, title: pageTitle, description, platform, categories, rules, keywords });
           const update: Record<string, unknown> = { updatedAt: new Date() };
-          if (!explicitCategory && suggestion.categoryName) {
-            const category = await db.collection("categories").findOne({ userId: user._id, name: suggestion.categoryName });
-            if (category) { update.categoryId = category._id; update.categoryName = category.name; }
+          if (needsMetadata) {
+            try {
+              const metadata = await fetchMetadata(normalized);
+              let canonicalUrl = normalized;
+              if (metadata.canonicalUrl) { try { canonicalUrl = normalizeUrl(metadata.canonicalUrl); } catch { /* Ignore invalid canonical metadata. */ } }
+              if (canonicalUrl !== normalized) {
+                const canonicalDuplicate = await coll.findOne({ userId: user._id, canonicalUrl });
+                if (canonicalDuplicate) {
+                  // The shared short link resolves to a video saved before: keep
+                  // one memory. Fold any fresh notes in, drop the copy we just made.
+                  const patch: Record<string, unknown> = { updatedAt: new Date() };
+                  const freshNotes = safeText(body.notes, 5000);
+                  if (freshNotes && !canonicalDuplicate.notes) patch.notes = freshNotes;
+                  if (!canonicalDuplicate.thumbnailUrl && item.thumbnailUrl) patch.thumbnailUrl = item.thumbnailUrl;
+                  await coll.updateOne({ _id: canonicalDuplicate._id }, { $set: patch });
+                  await coll.deleteOne({ _id: result.insertedId });
+                  await db.collection("activity").deleteMany({ userId: user._id, itemId: result.insertedId });
+                  return;
+                }
+                await coll.updateOne({ _id: result.insertedId }, { $set: { canonicalUrl, updatedAt: new Date() } });
+              }
+              if (!title && metadata.title) update.title = metadata.title;
+              if (!description && metadata.description) update.description = metadata.description;
+              if (!thumbnailUrl && metadata.thumbnailUrl) update.thumbnailUrl = metadata.thumbnailUrl;
+              if (!authorName && metadata.authorName) update.authorName = metadata.authorName;
+            } catch { /* URL remains saved with the details it arrived with. */ }
           }
-          if (!explicitCategory && suggestion.reason) update.reason = suggestion.reason;
-          if (!explicitTags && suggestion.tags?.length) {
-            update.tags = suggestion.tags;
-            await Promise.all(suggestion.tags.map((name: string) => db.collection("tags").updateOne({ userId: user._id, name }, { $setOnInsert: { userId: user._id, name, createdAt: new Date() } }, { upsert: true })));
+          if (needsSuggestions) {
+            const categories = (await db.collection("categories").find({ userId: user._id }).project({ name: 1, _id: 0 }).toArray()).map(({ name }) => name);
+            const rules = (await db.collection("category_rules").find({ userId: user._id }).sort({ createdAt: 1 }).toArray()).map(({ categoryName, keywords: ruleKeywords }) => ({ categoryName, keywords: Array.isArray(ruleKeywords) ? ruleKeywords : [] }));
+            const enrichTitle = String(update.title || item.title);
+            const enrichDescription = String(update.description || item.description);
+            const suggestion = suggestMeta({ url: normalized, title: enrichTitle, description: enrichDescription, platform, categories, rules, keywords });
+            if (!explicitCategory && suggestion.categoryName) {
+              const category = await db.collection("categories").findOne({ userId: user._id, name: suggestion.categoryName });
+              if (category) { update.categoryId = category._id; update.categoryName = category.name; }
+            }
+            if (!explicitCategory && suggestion.reason && !item.reason) update.reason = suggestion.reason;
+            if (!explicitTags && suggestion.tags?.length) {
+              update.tags = suggestion.tags;
+              await Promise.all(suggestion.tags.map((name: string) => db.collection("tags").updateOne({ userId: user._id, name }, { $setOnInsert: { userId: user._id, name, createdAt: new Date() } }, { upsert: true })));
+            }
           }
           if (Object.keys(update).length > 1) await coll.updateOne({ _id: result.insertedId }, { $set: update });
         } catch { /* Best-effort enrichment; the saved item is already safe either way. */ }
       });
     }
 
-    return Response.json({ itemId: result.insertedId.toHexString(), title: item.title, platform, url: item.url, reason: item.reason, categoryName: item.categoryName, tags: item.tags, thumbnailUrl: item.thumbnailUrl, message: "Saved to your memory." }, { status: 201 });
+    return Response.json({ itemId: result.insertedId.toHexString(), title: item.title, platform, url: item.url, reason: item.reason, categoryName: item.categoryName, tags: item.tags, thumbnailUrl: item.thumbnailUrl, pending: needsMetadata, message: "Saved to your memory." }, { status: 201 });
   } catch (error) { if ((error as { code?: number }).code === 11000) return jsonError("This is already in your memory.", 409); return handleError(error); }
 }
